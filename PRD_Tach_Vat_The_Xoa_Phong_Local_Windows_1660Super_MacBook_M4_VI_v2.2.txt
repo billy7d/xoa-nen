@@ -1,0 +1,2115 @@
+PRD — LOCAL POD CUTOUT EDITOR
+TÁCH NỀN ARTWORK / ẢNH AI CHÍNH XÁC CAO CHO DTG/DTF
+
+Phiên bản: 2.2
+Ngày: 2026-08-08
+Ngôn ngữ: Tiếng Việt
+Trạng thái: Sẵn sàng cho PHASE 0 — QUALIFICATION
+
+Tài liệu gốc tham chiếu:
+    PRD_Tach_Vat_The_Xoa_Phong_Local_Windows_1660Super_MacBook_M4_VI.txt
+    Phiên bản 2.1 được giữ nguyên để đối chiếu.
+
+
+======================================================================
+0. CHANGELOG 2.2
+======================================================================
+
+Các quyết định sản phẩm đã khóa:
+
+- App dùng cá nhân/nội bộ, chạy local.
+- V1 ưu tiên single-image editor cực chi tiết.
+- Đầu vào chính là artwork, clipart và ảnh AI.
+- Mục tiêu output chính là PNG trong suốt cho DTG/DTF chung.
+- Giữ mọi component rời có chủ ý; không tự xóa hạt grunge/distressed.
+- Mỗi project có master RGB-identical và POD-ready derivative riêng.
+- FAST mục tiêu <= 30 giây; QUALITY mục tiêu <= 90 giây cho ảnh 20-30 MP.
+- Desktop stack: Tauri v2 + React/TypeScript/WebGL + Python sidecar.
+
+Các thay đổi quan trọng so với 2.1:
+
+- Tách rõ MASTER_SOURCE_FAITHFUL, POD_READY và ALPHA_ONLY.
+- Thêm ARTWORK mode và bộ công cụ Background Sample / Color Range / Magic Wand.
+- Không mặc định BiRefNet HR 1536/2048 trên GTX 1660 Super 6 GB.
+- Thêm PHASE 0 để benchmark model, backend, packaging, memory và quality.
+- Đổi confidence_map thành uncertainty_heuristic.
+- Thêm Canonical Image Contract, straight-alpha contract và source-alpha constraint.
+- Chuyển architecture sang Tauri IPC; không mở FastAPI localhost mặc định.
+- Alpha authoritative dùng float32 disk-backed tiles; project không lưu alpha làm PNG 8-bit.
+- Đưa shadow vật lý, glass/refraction, multi-object layers, batch và provider preset ra sau V1.
+- Thêm POD preflight, effective PPI, halo check và component inspection.
+- Bắt buộc ModelManifest, pinned revision, checksum và license gate.
+
+
+======================================================================
+1. TỔNG QUAN SẢN PHẨM
+======================================================================
+
+1.1 Tên sản phẩm tạm thời
+
+    Local POD Cutout Editor
+
+
+1.2 Product statement
+
+Một desktop app chạy local giúp người làm POD:
+
+- tách nền artwork và ảnh AI;
+- giữ chữ, line art, negative space và chi tiết rời;
+- chỉnh alpha tới từng pixel;
+- kiểm tra halo và vùng bán trong suốt;
+- xuất master trung thực nguồn;
+- xuất PNG sRGB trong suốt sẵn sàng cho DTG/DTF;
+- không cần API trả phí hoặc cloud inference.
+
+
+1.3 Người dùng mục tiêu
+
+Primary user:
+
+- người làm POD cá nhân;
+- xử lý từng artwork quan trọng;
+- cần kiểm soát tuyệt đối hơn là tốc độ hàng loạt;
+- dùng Windows GTX 1660 Super hoặc MacBook Apple Silicon M4.
+
+
+1.4 Job to be done
+
+Khi có một artwork hoặc ảnh AI còn nền, user muốn:
+
+1. mở ảnh mà không làm thay đổi source;
+2. tách foreground tự động;
+3. giữ toàn bộ chi tiết có chủ ý;
+4. xem vùng AI không chắc chắn;
+5. sửa chính xác tại native resolution;
+6. kiểm tra trên nhiều màu vật liệu;
+7. xuất master và bản POD-ready độc lập.
+
+
+1.5 Thứ tự ưu tiên
+
+1. Accuracy trên artwork/ảnh AI
+2. Source preservation
+3. Native-resolution editing
+4. Bảo toàn component/topology
+5. Chất lượng viền khi in/composite
+6. Stability và recovery
+7. Cross-platform correctness
+8. Memory safety
+9. Speed
+
+
+======================================================================
+2. PHẠM VI V1
+======================================================================
+
+2.1 Trong phạm vi
+
+- Single-image project.
+- Artwork/ảnh AI có nền phẳng hoặc nền phức tạp.
+- Một semantic subject có thể gồm nhiều component rời.
+- Hard edge, anti-alias, line art, typography, distressed texture.
+- Glow và transparency nội bộ ở mức alpha/RGBA thông thường.
+- AI auto cutout.
+- Background sample, color range và magic wand.
+- Manual editor native-resolution.
+- Local AI refine.
+- Master, POD-ready và alpha-only export.
+- Generic DTG/DTF preflight.
+- Project save/restore.
+- Offline operation sau khi model đã cài.
+
+
+2.2 Ngoài phạm vi V1
+
+- Batch processing và review queue.
+- Printful/Printify/provider-specific preset.
+- Listing image và mockup generation.
+- Marketplace upload/publishing.
+- Multi-object layer separation.
+- Inpainting phần object bị che.
+- Shadow có thể chuyển đúng sang mọi background.
+- Glass/refraction vật lý chính xác.
+- Vectorizer hoặc SVG reconstruction.
+- AI super-resolution.
+- HEIC, PSD, TIFF 16-bit, HDR và animated image.
+- Video background removal.
+- Core ML, MLX, ONNX, TensorRT làm backend production.
+- Active learning/fine-tune trong app.
+
+
+2.3 Nguyên tắc defer
+
+Chức năng ngoài V1 không được thêm nếu làm chậm:
+
+- editor native-resolution;
+- correctness của master/POD export;
+- recovery trên hai máy mục tiêu;
+- quality qualification.
+
+
+======================================================================
+3. NỀN TẢNG VÀ PHẦN CỨNG MỤC TIÊU
+======================================================================
+
+3.1 Windows reference
+
+- Windows 11 x64.
+- NVIDIA GTX 1660 Super 6 GB VRAM.
+- 16 GB system RAM.
+- Backend ưu tiên: CUDA.
+- Fallback: CPU.
+- Packaged app không yêu cầu WSL, nvcc, Visual Studio compiler hoặc Python cài sẵn.
+
+
+3.2 macOS reference
+
+- macOS 15+ arm64.
+- MacBook Pro Apple Silicon M4.
+- Không giả định cứng dung lượng unified memory.
+- Backend ưu tiên theo qualification: PyTorch MPS hoặc CPU nếu MPS không đạt parity/stability.
+- Fallback theo từng model stage.
+
+
+3.3 CPU fallback
+
+- Correctness-only.
+- Không có SLA FAST/QUALITY.
+- Phải hiển thị rõ đang dùng CPU.
+- Không được âm thầm hạ quality mà không báo user.
+
+
+======================================================================
+4. NGUYÊN TẮC CỐT LÕI
+======================================================================
+
+4.1 Source bất biến
+
+File source không bao giờ bị ghi đè.
+
+Canonical RGB là buffer bất biến trong project.
+
+AI chỉ được quyết định:
+
+- object membership;
+- alpha;
+- trimap;
+- uncertainty heuristic;
+- topology;
+- boundary refinement;
+- foreground/background proposal.
+
+
+4.2 Không dùng generative processing trong V1
+
+Không được dùng:
+
+- generative inpainting;
+- generative fill;
+- AI regenerate;
+- AI super-resolution;
+- RGB denoise/sharpen/recolor trong master;
+- background synthesis;
+- object completion.
+
+
+4.3 Không che lỗi bằng blur
+
+Không global Gaussian blur mask.
+
+Không average mask mù quáng.
+
+Không contour-fill mù quáng.
+
+Không tự xóa component nhỏ chỉ vì diện tích nhỏ.
+
+
+4.4 Auto result và Verified result
+
+AUTO_RESULT:
+
+- output tự động;
+- có thể còn vùng Needs Review.
+
+VERIFIED_RESULT:
+
+- user đã kiểm tra uncertainty/component/halo;
+- hoặc đã sửa và approve.
+
+
+======================================================================
+5. CANONICAL IMAGE CONTRACT
+======================================================================
+
+5.1 Format input V1
+
+Hỗ trợ:
+
+- PNG 8-bit;
+- JPEG 8-bit;
+- static WebP 8-bit;
+- RGB;
+- RGBA;
+- grayscale;
+- palette image;
+- CMYK JPEG với conversion có kiểm soát.
+
+Không hỗ trợ V1:
+
+- animated/multi-frame image;
+- HEIC;
+- PSD;
+- TIFF/PNG 16-bit source;
+- HDR/float source;
+- raw camera format.
+
+
+5.2 Giới hạn kích thước
+
+Guaranteed support:
+
+- tổng pixel <= 40 MP;
+- mỗi cạnh <= 10.000 px.
+
+Ảnh lớn hơn:
+
+- best-effort;
+- cảnh báo memory/disk;
+- không được silently downscale output.
+
+
+5.3 Canonical decode
+
+CanonicalImage phải lưu:
+
+- source_file_sha256;
+- canonical_pixels_sha256;
+- width;
+- height;
+- source format;
+- original EXIF orientation;
+- canonical orientation;
+- RGB8 unpremultiplied pixels;
+- optional source alpha;
+- ICC profile bytes/hash;
+- conversion flags;
+- decoder version.
+
+
+5.4 Orientation
+
+- EXIF orientation được bake đúng một lần.
+- Sau khi bake, canonical orientation là orientation 1.
+- Mọi preview, prompt, brush, ROI và export dùng cùng canonical coordinate system.
+- Export không ghi lại orientation cũ gây rotate lần hai.
+
+
+5.5 ICC và CMYK
+
+- Inference copy được color-convert sang sRGB.
+- Canonical source không bị inference conversion ghi đè.
+- CMYK được convert thành canonical sRGB và gắn SOURCE_CONVERTED.
+- RGB integrity của CMYK/JPEG được định nghĩa trên canonical decoded pixels.
+- Invalid ICC phải tạo warning, không crash.
+
+
+5.6 Input đã có alpha
+
+Mặc định:
+
+    FINAL_ALPHA = SOURCE_ALPHA * CUTOUT_ALPHA
+
+Không model hoặc manual operation nào được làm sống lại pixel có source alpha = 0.
+
+
+======================================================================
+6. HỢP ĐỒNG ALPHA VÀ COMPOSITING
+======================================================================
+
+6.1 Internal alpha
+
+- float32;
+- range logic 0.0..1.0;
+- authoritative storage là disk-backed tiles;
+- NaN/Inf là stage failure;
+- chỉ clamp sau validation;
+- không quantize sớm.
+
+
+6.2 Straight alpha
+
+PNG output phải dùng straight/unassociated alpha.
+
+Frontend WebGL có thể premultiply để render, nhưng:
+
+- không được lấy pixel export từ Canvas/WebGL;
+- backend phải ghép RGB và alpha trực tiếp;
+- test round-trip bằng decoder độc lập.
+
+
+6.3 Giới hạn toán học của RGB-identical
+
+Pixel ảnh quan sát có thể là:
+
+    C = alpha * F + (1 - alpha) * B
+
+Giữ C làm RGB rồi thay background mới có thể giữ lại màu nền B cũ tại tóc/glow/edge.
+
+Vì vậy:
+
+- MASTER_SOURCE_FAITHFUL ưu tiên RGB-identical;
+- POD_READY được phép ước lượng/decontaminate edge RGB;
+- app không tuyên bố hai mode cho kết quả composite giống nhau.
+
+
+======================================================================
+7. OUTPUT CONTRACT
+======================================================================
+
+7.1 MASTER_SOURCE_FAITHFUL
+
+Default master.
+
+Yêu cầu:
+
+- output width == canonical width;
+- output height == canonical height;
+- output RGB == canonical RGB ở mọi pixel;
+- output alpha == final alpha đã quantize;
+- PNG lossless;
+- không sửa edge RGB;
+- không resize/trim/canvas placement.
+
+RGB integrity:
+
+    np.array_equal(canonical_rgb, master_rgba[:, :, :3]) == True
+
+
+7.2 POD_READY
+
+Derived output riêng, không ghi đè master.
+
+Yêu cầu:
+
+- PNG RGBA 8-bit;
+- embedded/declared sRGB;
+- straight alpha;
+- color-managed conversion từ canonical ICC sang sRGB có thể đổi numeric RGB
+  trên toàn ảnh nhưng phải giữ appearance trong giới hạn conversion đã test;
+- edge decontamination chỉ quanh fractional/uncertain edge;
+- opaque interior không bị chỉnh màu ngoài conversion ICC -> sRGB bắt buộc;
+- preview trước export;
+- cùng pixel dimensions mặc định;
+- trim/padding/custom canvas chỉ khi user bật.
+
+Cho phép POD_READY RGB khác master do color conversion và ở vùng xử lý viền.
+
+
+7.3 ALPHA_ONLY
+
+- grayscale PNG 16-bit;
+- native dimensions;
+- dùng cho QA/interchange;
+- không phải authoritative project storage.
+
+
+7.4 Metadata
+
+Master giữ allowlist:
+
+- ICC;
+- PPI nếu hợp lệ;
+- copyright/creator nếu user chọn.
+
+POD_READY:
+
+- sRGB ICC;
+- PPI do export setting;
+- strip GPS và metadata riêng tư;
+- không lưu model/debug data trong PNG.
+
+
+7.5 Export safety
+
+- Không overwrite source.
+- Collision phải hỏi hoặc tạo tên deterministic.
+- Default filename:
+  - <source-stem>-master.png;
+  - <source-stem>-pod.png;
+  - <source-stem>-alpha16.png.
+- Export dùng temp file + fsync + atomic rename.
+- Disk full phải giữ project và output cũ nguyên vẹn.
+
+
+======================================================================
+8. GENERIC DTG/DTF PREFLIGHT
+======================================================================
+
+8.1 Physical size và effective PPI
+
+User có thể nhập:
+
+- width/height theo inch hoặc cm;
+- target PPI;
+- custom transparent canvas.
+
+Công thức:
+
+    effective_ppi_x = placed_pixel_width / print_width_inch
+    effective_ppi_y = placed_pixel_height / print_height_inch
+
+Default guidance:
+
+- target: 300 PPI;
+- warning dưới 150 PPI;
+- không tự upscale;
+- không coi metadata 300 DPI là tăng chất lượng.
+
+
+8.2 Preflight result
+
+Trạng thái:
+
+- PASS;
+- WARN;
+- FAIL.
+
+FAIL dành cho:
+
+- file corrupt;
+- unsupported export;
+- alpha/output invalid;
+- export không thể hoàn tất.
+
+WARN có thể override và được ghi vào report.
+
+
+8.3 Preflight checks
+
+- effective PPI;
+- pixel dimensions;
+- file size;
+- profile/sRGB;
+- alpha min/max/histogram;
+- pixel alpha rất thấp nhưng khác 0;
+- stray pixel và isolated speck;
+- component nhỏ/rời;
+- accidental opaque rectangle;
+- subject bị clip bởi canvas;
+- semi-transparent coverage;
+- halo trên white/black/gray và custom garment colors;
+- hidden RGB bất thường quanh transparent edge;
+- source converted warning.
+
+
+8.4 Chính sách component
+
+- Không auto-delete component nhỏ.
+- Component đáng ngờ được gắn NEEDS_REVIEW.
+- User có thể keep/remove/lock từng component.
+- Distressed texture và hạt grunge phải có fixture riêng.
+
+
+======================================================================
+9. WORKFLOW V1
+======================================================================
+
+Luồng mặc định:
+
+    CREATE/OPEN PROJECT
+        -> IMPORT + CANONICAL DECODE
+        -> HARDWARE PROFILE
+        -> ARTWORK ANALYSIS
+        -> BASE ALPHA PROPOSAL
+        -> UNCERTAINTY + COMPONENT ANALYSIS
+        -> CONDITIONAL SAM TOPOLOGY
+        -> TRIMAP + NATIVE ROI REFINE
+        -> MANUAL EDITOR
+        -> VERIFIED REVIEW
+        -> POD PREFLIGHT
+        -> MASTER + POD_READY + OPTIONAL ALPHA EXPORT
+
+User không cần biết model/backend trong workflow chính.
+
+Thông tin model nằm trong Advanced/Diagnostics.
+
+
+======================================================================
+10. PROCESSING MODES
+======================================================================
+
+10.1 ARTWORK
+
+Mode mặc định.
+
+Ưu tiên:
+
+- hard edge;
+- typography;
+- line art;
+- flat color;
+- anti-alias;
+- disconnected intentional component;
+- distressed texture;
+- glow/transparency nội bộ.
+
+
+10.2 FAST
+
+Mục tiêu:
+
+- base proposal nhanh;
+- basic component/edge validation;
+- không tự chạy mọi model.
+
+Target p95:
+
+    <= 30 giây cho ảnh 20-30 MP trên hardware reference.
+
+
+10.3 QUALITY
+
+Default processing preset.
+
+Pipeline:
+
+- artwork/color analysis;
+- BiRefNet proposal;
+- uncertainty heuristic;
+- conditional SAM khi cần;
+- trimap;
+- native ROI ViTMatte;
+- component review.
+
+Target p95:
+
+    <= 90 giây cho ảnh 20-30 MP trên hardware reference.
+
+
+10.4 MAX
+
+- Asset quan trọng.
+- Có thể dùng HR/multi-scale/flip consistency.
+- Chỉ dùng pass đã chứng minh tăng quality.
+- Không có SLA 90 giây.
+- Phải hiển thị estimated time/profile.
+
+
+======================================================================
+11. ARTWORK EXTRACTION TOOLCHAIN
+======================================================================
+
+11.1 Background Sample
+
+User có thể lấy một hoặc nhiều sample nền.
+
+Thông số:
+
+- tolerance;
+- softness;
+- contiguous/global;
+- include/exclude sample;
+- border-connected only.
+
+
+11.2 Color Range
+
+- Chọn range theo color distance trên inference sRGB buffer.
+- Preview selection trước apply.
+- Add/Subtract mode.
+- Không tự xóa vùng cùng màu nằm bên trong nếu dùng border-connected.
+
+
+11.3 Magic Wand
+
+- Contiguous flood-fill.
+- Global color selection tùy chọn.
+- Anti-aliased edge estimation.
+- Native-coordinate result.
+- Undoable và non-destructive.
+
+
+11.4 AI + classical fusion
+
+Classical color/edge result không tự thay final alpha.
+
+Nó được dùng như:
+
+- foreground/background evidence;
+- trimap evidence;
+- component discovery;
+- user-assisted correction.
+
+AI vẫn hỗ trợ khi background không phẳng hoặc color range mơ hồ.
+
+
+======================================================================
+12. MODEL STACK V1
+======================================================================
+
+12.1 Base alpha proposal
+
+Provisional default:
+
+- BiRefNet_dynamic-matting hoặc BiRefNet-matting;
+- input 1024;
+- FP16 khi parity pass;
+- FP32 fallback.
+
+Fallback:
+
+- BiRefNet_lite-matting.
+
+MAX-only candidate:
+
+- BiRefNet_HR-matting sau qualification.
+
+
+12.2 SAM 2.1 Base+
+
+Vai trò:
+
+- user point/box selection;
+- object membership;
+- topology/hole/gap validation;
+- local correction.
+
+Không dùng SAM để:
+
+- thay toàn bộ fractional alpha;
+- tự tạo confidence probability;
+- hard-fill glow/transparency.
+
+Integration path:
+
+1. ưu tiên implementation thuần PyTorch/Transformers + safetensors;
+2. so output parity với implementation chính thức;
+3. nếu parity không đạt, vendor code Meta tại pinned commit;
+4. tắt runtime CUDA extension build;
+5. không dùng torch.compile trong packaged V1;
+6. không yêu cầu WSL, nvcc hoặc compiler trên máy user.
+
+
+12.3 ViTMatte
+
+Default:
+
+- ViTMatte-B;
+- dùng implementation Hugging Face Transformers, không phụ thuộc Detectron2;
+- weights/revision/safetensors được pin trong ModelManifest;
+- ROI target khoảng 512;
+- native pixel crop;
+- pad theo model divisor;
+- overlap tile khi ROI lớn.
+
+Fallback:
+
+- ViTMatte-S.
+
+
+12.4 Model candidate ở PHASE 0
+
+Benchmark có thể gồm:
+
+- BiRefNet dynamic/standard/lite/HR;
+- BEN2 Base;
+- FeyNoBg.
+
+Candidate chỉ được production nếu:
+
+- commercial POD use được phép;
+- exact weights license rõ;
+- quality tốt hơn trên internal holdout;
+- đạt memory/latency/stability gate;
+- không cần runtime remote code.
+
+Không thêm model thứ tư vào runtime mặc định chỉ vì benchmark một metric tốt hơn.
+
+
+12.5 BiRefNet integration
+
+- Vendor/audit model code tại pinned revision.
+- Không gọi trust_remote_code tại runtime.
+- Dùng exact preprocessing manifest cho resize/normalize/postprocess.
+- Safetensors/checksum bắt buộc trước load.
+- ONNX/CoreML/TensorRT chỉ được xem xét sau V1 nếu parity và timing tốt hơn.
+
+
+======================================================================
+13. MODEL QUALIFICATION RULES
+======================================================================
+
+13.1 Không hard-code claim từ GPU khác
+
+Benchmark A100/4090 không đại diện GTX 1660 Super hoặc M4.
+
+Mọi preferred resolution/dtype phải đo trên đúng máy mục tiêu.
+
+
+13.2 Windows provisional profile
+
+BiRefNet:
+
+- preferred 1024 FP16 nếu parity pass;
+- fallback 1024 FP32 hoặc Lite FP16/FP32;
+- 1280 chỉ khi measured profile pass;
+- HR chỉ MAX.
+
+SAM:
+
+- Base+ conditional;
+- FP16 hoặc FP32 đã qualify;
+- không dùng BF16 trên GTX 1660 Super nếu runtime báo không support.
+
+ViTMatte:
+
+- Base ROI 512;
+- Small fallback;
+- ROI 768 chỉ khi profile pass.
+
+
+13.3 macOS provisional profile
+
+- Test từng model trên MPS FP16 và FP32.
+- So parity với CPU FP32.
+- Unsupported op fallback phải được log.
+- Model nào crash/quality fail trên MPS dùng CPU riêng stage đó.
+- Không hard-code profile theo tên M4.
+- Không tắt MPS high-watermark safety.
+
+
+13.4 Parity gate
+
+Accelerated backend/dtype không được:
+
+- giảm Boundary F1 quá 0,5 percentage point;
+- tăng SAD/Gradient/Connectivity quá 2%;
+- làm mất component/topology fixture;
+- thay đổi source RGB.
+
+
+======================================================================
+14. PIPELINE VÀ FUSION RULES
+======================================================================
+
+14.1 Không average mask mù quáng
+
+Vai trò:
+
+    BiRefNet     -> base alpha proposal
+    Color tools  -> artwork/background evidence
+    SAM          -> membership/topology
+    ViTMatte     -> fractional boundary/internal transparency
+    Manual edit  -> user authority
+
+
+14.2 Precedence
+
+Thứ tự quyền ghi, từ cao xuống thấp:
+
+1. Source alpha upper bound
+2. Locked regions
+3. Manual edits
+4. Local AI refine
+5. ViTMatte unknown/unlocked ROI
+6. Base alpha proposal
+
+Stage thấp hơn không được ghi đè stage cao hơn.
+
+
+14.3 SAM auto prompt
+
+Khi cần topology validation:
+
+- tạo box từ connected component/base foreground;
+- positive point từ distance-transform interior;
+- negative point ngoài dilated component/box;
+- kiểm tra prompt satisfaction và overlap;
+- disagreement trở thành Needs Review hoặc ROI refine.
+
+SAM candidate không tự overwrite final alpha.
+
+
+14.4 Trimap
+
+Trimap gồm:
+
+- definite foreground;
+- unknown;
+- definite background.
+
+Definite FG/BG phải dựa trên:
+
+- consensus/evidence;
+- erosion/dilation có version;
+- user locks;
+- source alpha constraint.
+
+Không khóa sai chỉ dựa vào một threshold duy nhất.
+
+
+14.5 Unknown width
+
+Adaptive theo:
+
+- image scale;
+- edge hardness;
+- uncertainty;
+- glow/transparency;
+- component size.
+
+Không dùng một width cho mọi ảnh.
+
+
+======================================================================
+15. NATIVE-RESOLUTION ROI REFINEMENT
+======================================================================
+
+15.1 Nguyên tắc
+
+Coarse 1024 mask không được upscale rồi export trực tiếp.
+
+Phải:
+
+    proxy proposal
+      -> map về canonical coordinates
+      -> discover boundary/component/uncertain region
+      -> crop RGB native pixels
+      -> local matting/refine
+      -> write alpha vào native canvas
+
+
+15.2 ROI
+
+- Default target khoảng 512 x 512.
+- Context margin 64-256 px tùy edge.
+- ROI lớn được tile.
+- Overlap khoảng 96-128 px hoặc adaptive.
+- Pad tới model divisor, không distort aspect ratio.
+- Blend alpha bằng normalized raised-cosine weights.
+- Không blend RGB trong master.
+
+
+15.3 Discovery ngoài coarse boundary
+
+Phải có high-resolution discovery pass để tìm:
+
+- component nhỏ bị proposal bỏ sót;
+- line mảnh;
+- outer glow;
+- anti-aliased island;
+- gap/hole không ổn định.
+
+
+15.4 Internal transparency
+
+Artwork có glow/mesh/transparency nội bộ:
+
+- không hard-fill interior alpha = 1;
+- dùng expanded hoặc full-object ROI khi cần;
+- luôn hiển thị preview trên nền sáng/tối.
+
+
+======================================================================
+16. UNCERTAINTY HEURISTIC
+======================================================================
+
+16.1 Tên và ý nghĩa
+
+Tên chính thức:
+
+    uncertainty_heuristic
+
+Không gọi là xác suất đúng nếu chưa calibration.
+
+
+16.2 Nguồn heuristic
+
+- output gần threshold;
+- disagreement multi-scale/flip;
+- BiRefNet/SAM topology conflict;
+- artwork color evidence conflict;
+- unstable boundary;
+- component xuất hiện/mất theo scale;
+- high fractional-alpha area;
+- ROI seam risk.
+
+
+16.3 UI
+
+- red: Needs Review cao;
+- yellow: review khuyến nghị;
+- clear: không phát hiện vấn đề đáng kể.
+
+UI phải ghi rõ đây là heuristic, không phải guarantee.
+
+
+======================================================================
+17. MANUAL EDITOR
+======================================================================
+
+17.1 Tool bắt buộc
+
+- Keep Brush
+- Remove Brush
+- Alpha Brush
+- Unknown/Refine Brush
+- Restore Brush
+- Lasso Keep
+- Lasso Remove
+- Polygonal Lasso
+- Add AI Point
+- Remove AI Point
+- Bounding Box
+- Local AI Refine
+- Background Sample
+- Color Range
+- Magic Wand Contiguous
+- Magic Wand Global
+- Alpha Levels/Threshold preview
+- Edge Contract/Expand preview
+- Defringe/Decontaminate preview
+- Component Inspector
+- Lock/Unlock Region
+- Undo
+- Redo
+
+
+17.2 Native-coordinate editing
+
+- Edit lưu bằng canonical native coordinates.
+- Brush 1 px tác động đúng pixel source.
+- Pointer transform không phụ thuộc zoom/devicePixelRatio.
+- Brush rasterization algorithm có version.
+
+
+17.3 Zoom và navigation
+
+Tối thiểu:
+
+- Fit
+- 25%
+- 50%
+- 100%
+- 200%
+- 400%
+- 800%
+- 1600%
+- 3200%
+
+Zoom cao:
+
+- pixel grid;
+- alpha value inspection;
+- pixel coordinate;
+- component boundary overlay.
+
+
+17.4 Preview modes
+
+- Original
+- Transparent
+- Checkerboard
+- White BG
+- Black BG
+- Gray BG
+- Custom garment colors
+- Mask
+- Alpha
+- Edge
+- Uncertainty
+- Component IDs
+- Before/After split
+- Master/POD-ready comparison
+
+
+17.5 Locked regions
+
+Hỗ trợ:
+
+- LOCKED_FOREGROUND
+- LOCKED_BACKGROUND
+- LOCKED_ALPHA
+
+AI/local refine không được thay đổi locked pixels.
+
+
+17.6 Editor latency target
+
+- Brush commit p95 <= 50 ms.
+- Undo/redo p95 <= 50 ms.
+- Pan/zoom >= 30 fps trên ảnh guaranteed size.
+- UI không block trong model inference/export.
+
+
+======================================================================
+18. TOPOLOGY VÀ COMPONENT PRESERVATION
+======================================================================
+
+18.1 Bảo toàn
+
+- hole;
+- loop;
+- gap;
+- negative space;
+- disconnected intentional island;
+- typography counter;
+- thin line;
+- distressed texture.
+
+
+18.2 Không tự cleanup phá dữ liệu
+
+Không auto-remove theo area threshold trong final alpha.
+
+Cleanup operation phải:
+
+- có preview;
+- liệt kê component bị ảnh hưởng;
+- undoable;
+- tôn trọng locks.
+
+
+18.3 One semantic subject
+
+V1 không tạo nhiều object layer độc lập.
+
+Một subject có thể gồm nhiều connected components.
+
+
+======================================================================
+19. NON-DESTRUCTIVE EDITING VÀ TILE STORE
+======================================================================
+
+19.1 Authoritative data
+
+- canonical RGB8 immutable;
+- base alpha float32 tiles;
+- current alpha float32 tiles;
+- lock tiles;
+- uncertainty/component maps;
+- edit journal.
+
+
+19.2 Tile strategy
+
+- Disk-backed.
+- Compressed float32 tile payload.
+- GPU/CPU chỉ load proxy hoặc active ROI.
+- Không giữ full-resolution float RGB.
+- Export streaming theo tile/row.
+
+
+19.3 History
+
+- Brush/lasso lưu operation metadata và compressed tile delta.
+- Không clone full alpha canvas cho mỗi action.
+- Snapshot mỗi 50 operations hoặc 30 giây khi có thay đổi.
+- Append journal sau từng committed edit.
+
+
+19.4 Autosave
+
+- Background autosave.
+- Temp + fsync + atomic replace.
+- Crash không làm mất last valid snapshot.
+- Reopen không bắt buộc rerun AI.
+
+
+======================================================================
+20. PROJECT FORMAT
+======================================================================
+
+20.1 Package
+
+    project-name.cutoutproj/
+      manifest.json
+      source/
+        reference.json
+        original.ext          # optional embed
+        canonical.png         # optional portable cache
+      alpha/
+        base/
+          <tile>.f32.zst
+        current/
+          <tile>.f32.zst
+      locks/
+        <tile>.bin.zst
+      journal/
+        edits.jsonl
+        snapshots/
+      previews/
+      reports/
+
+
+20.2 Reference và portable mode
+
+Default:
+
+- source reference;
+- raw/canonical hash;
+- không copy source nếu user không yêu cầu.
+
+Portable mode:
+
+- embed source;
+- verify checksum;
+- hiển thị disk estimate trước khi save.
+
+
+20.3 manifest.json
+
+Bắt buộc có:
+
+- schema_version;
+- app_version;
+- source/canonical hashes;
+- dimensions;
+- orientation transform;
+- ICC hash;
+- decoder version;
+- coordinate convention;
+- model manifests/revisions;
+- preprocessing version;
+- hardware profile;
+- export settings;
+- blob checksums;
+- last valid journal sequence.
+
+
+20.4 Migration
+
+- Không mở schema mới bằng app cũ nếu không an toàn.
+- Migration tạo backup manifest.
+- Không silently flatten history.
+- Unknown field được preserve khi khả thi.
+
+
+======================================================================
+21. DESKTOP ARCHITECTURE
+======================================================================
+
+21.1 Thành phần
+
+    Tauri v2 shell
+        + React / TypeScript / WebGL viewer
+        + restricted Tauri IPC
+        + Python coordinator sidecar
+        + sequential model subprocess workers
+        + disk-backed project/tile store
+
+
+21.2 Không dùng localhost server mặc định
+
+- Không mở FastAPI port.
+- IPC qua stdio hoặc named pipe.
+- Message JSON nhỏ.
+- Pixel/tile lớn đi qua scoped files, không base64.
+- Frontend chỉ nhận opaque image/project/job IDs.
+
+
+21.3 Frontend security
+
+- Không load remote web content.
+- Content Security Policy chặt.
+- Tauri capability allowlist tối thiểu.
+- File picker do shell quản lý.
+- Frontend không được đọc path tùy ý ngoài scope.
+
+
+21.4 Coordinator
+
+Nhiệm vụ:
+
+- validate request;
+- manage project IDs;
+- schedule sequential stage;
+- spawn/monitor worker;
+- progress/cancel;
+- memory profile;
+- checkpoint stage output;
+- recover crash/OOM;
+- stream logs an toàn.
+
+
+======================================================================
+22. IPC INTERFACES
+======================================================================
+
+22.1 Quy tắc chung
+
+- Versioned JSON-RPC messages.
+- Opaque IDs thay cho arbitrary paths.
+- Request có request_id và project_id.
+- Response có status/progress/error_code.
+- Không gửi raw image/base64 qua JSON.
+- Cancel là idempotent.
+
+
+22.2 CanonicalImage
+
+Fields tối thiểu:
+
+    image_id
+    source_file_sha256
+    canonical_pixels_sha256
+    width
+    height
+    source_format
+    source_color_mode
+    original_orientation
+    canonical_orientation
+    icc_hash
+    has_source_alpha
+    conversion_flags[]
+    decoder_version
+
+
+22.3 ProcessRequest
+
+    request_id
+    project_id
+    image_id
+    content_mode = ARTWORK
+    quality_preset = FAST | QUALITY | MAX
+    subject_policy = PRESERVE_COMPONENTS
+    background_samples[]
+    hardware_profile_id
+
+
+22.4 LocalRefineRequest
+
+    request_id
+    project_id
+    roi_native_half_open
+    positive_points[]
+    negative_points[]
+    refine_engine = AUTO | SAM | VITMATTE | COLOR
+    respect_locks = true
+
+
+22.5 EditOperation
+
+    operation_id
+    project_id
+    tool
+    canonical_points[]
+    brush_radius
+    hardness
+    opacity
+    mode
+    algorithm_version
+    affected_tiles[]
+    journal_sequence
+
+
+22.6 ExportRequest
+
+    request_id
+    project_id
+    output_mode = MASTER_SOURCE_FAITHFUL | POD_READY | ALPHA_ONLY
+    destination_scope_id
+    physical_size
+    target_ppi
+    trim
+    padding
+    canvas
+    edge_treatment
+    metadata_policy
+
+
+22.7 PreflightReport
+
+    report_version
+    project_id
+    output_mode
+    status = PASS | WARN | FAIL
+    effective_ppi
+    pixel_dimensions
+    subject_bounds
+    alpha_statistics
+    component_statistics
+    color_profile
+    warnings[]
+    overrides[]
+    generated_at
+
+
+======================================================================
+23. COORDINATE SYSTEM
+======================================================================
+
+23.1 Pixel convention
+
+- Pixel center: (x + 0.5, y + 0.5).
+- Rectangle: half-open [x0, x1) x [y0, y1).
+- Transform: affine float64.
+- Indices storage: integer canonical coordinates.
+
+
+23.2 Preview transforms
+
+Lưu hai chiều:
+
+- canonical -> preview;
+- preview -> canonical.
+
+Test phải bao gồm:
+
+- HiDPI;
+- devicePixelRatio;
+- fractional zoom;
+- rotated EXIF source;
+- brush 1 px tại 3200%.
+
+
+======================================================================
+24. DEVICE MANAGER VÀ HARDWARE PROFILE
+======================================================================
+
+24.1 DeviceManager
+
+Nhiệm vụ:
+
+- detect OS/arch;
+- detect CUDA/MPS/CPU;
+- detect accelerator name;
+- read system memory;
+- read CUDA free/total memory;
+- read MPS allocator/recommended working set khi khả thi;
+- chọn model/dtype/resolution;
+- invalidate stale profile;
+- expose diagnostic data.
+
+
+24.2 hardware_profile.json
+
+Fields:
+
+    profile_version
+    platform
+    os_version
+    accelerator
+    accelerator_name
+    driver_version
+    torch_version
+    total_system_memory
+    model_profiles{}
+    benchmark_version
+    preprocessing_version
+    created_at
+
+
+24.3 Invalidation
+
+Rerun qualification khi thay đổi:
+
+- app major/minor engine version;
+- PyTorch/runtime;
+- OS/driver;
+- model revision;
+- preprocessing version;
+- hardware.
+
+
+======================================================================
+25. MEMORY PLAN
+======================================================================
+
+25.1 Windows
+
+- Một heavy model active tại một thời điểm.
+- Target stage peak VRAM <= 5,0 GiB.
+- Chừa tối thiểu 768 MiB free khi có thể đo.
+- Tổng app RSS mục tiêu <= 9 GiB trên máy 16 GB.
+- Không dựa vào empty_cache như bảo đảm recovery.
+
+
+25.2 macOS
+
+- Unified memory profile động.
+- Không hard-code M4 = một dung lượng VRAM.
+- Tôn trọng recommended working set/watermark.
+- Release model khi memory pressure cao.
+- Warm cache không có trong V1 mặc định.
+
+
+25.3 Image/mask memory
+
+- Canonical RGB8 immutable.
+- Proxy RGB nhỏ cho viewer/inference.
+- Float32 alpha theo tile.
+- Active ROI mới tạo float inference buffers.
+- History dùng tile delta nén.
+
+
+======================================================================
+26. WORKER LIFECYCLE VÀ RECOVERY
+======================================================================
+
+26.1 Sequential worker
+
+    spawn stage worker
+      -> load pinned model
+      -> infer
+      -> validate alpha/output
+      -> persist stage result
+      -> exit/reuse theo safe profile
+
+
+26.2 OOM recovery
+
+Khi CUDA/MPS OOM hoặc worker fatal:
+
+1. coordinator đánh dấu stage failed;
+2. kill/reap worker;
+3. giữ last valid project snapshot;
+4. restart worker;
+5. retry với lower profile;
+6. nếu vẫn fail, đề nghị/áp dụng CPU fallback có thông báo;
+7. không crash frontend.
+
+
+26.3 Không silent degradation
+
+Mỗi fallback phải ghi:
+
+- lý do;
+- model/profile cũ;
+- model/profile mới;
+- quality implication;
+- user-visible notification.
+
+
+26.4 Cancel
+
+- User có thể cancel stage.
+- Cancel không xóa last valid alpha.
+- Worker được shutdown có timeout rồi terminate nếu cần.
+- Project vẫn mở/editable.
+
+
+======================================================================
+27. MODEL MANAGER VÀ SUPPLY CHAIN
+======================================================================
+
+27.1 ModelManifest
+
+Bắt buộc:
+
+    model_id
+    model_revision
+    code_revision
+    engine
+    weight_filename
+    byte_size
+    sha256
+    source_url
+    code_license
+    weight_license
+    commercial_pod_allowed
+    redistribution_allowed
+    preprocess_version
+    runtime_compatibility
+    allowed_backend_dtype_profiles[]
+    notices[]
+
+
+27.2 Runtime safety
+
+- Cấm trust_remote_code tại runtime.
+- Ưu tiên safetensors.
+- .pt chỉ dùng pinned artifact, checksum và safe load option.
+- Không execute model-provided script tải từ internet.
+- Manifest bundled/pinned là trust root.
+
+
+27.3 Download
+
+- Download thủ công hoặc qua Model Manager.
+- Hiển thị dung lượng/license trước tải.
+- .part file;
+- resume nếu server hỗ trợ;
+- SHA-256;
+- atomic rename;
+- corrupt model không được load.
+
+
+27.4 Offline model pack
+
+Hỗ trợ install từ local .modelpack:
+
+- manifest;
+- weights;
+- checksums;
+- licenses/notices.
+
+Import phải chặn:
+
+- path traversal;
+- symlink escape;
+- oversized manifest;
+- checksum mismatch.
+
+
+27.5 License gate
+
+Production/internal POD workflow chỉ dùng artifact cho phép commercial use.
+
+Không bundle/use mặc định:
+
+- BRIA RMBG non-commercial weights;
+- research-only weights;
+- artifact thiếu exact weight license.
+
+
+======================================================================
+28. OFFLINE, PRIVACY VÀ LOGGING
+======================================================================
+
+28.1 Offline
+
+Sau khi runtime/model đã cài:
+
+- normal inference không cần mạng;
+- không gọi cloud/API;
+- không check update mỗi lần process;
+- network-denied test phải pass.
+
+
+28.2 Telemetry
+
+- Không telemetry mặc định.
+- Không upload image, alpha, prompt hoặc project.
+- Không analytics SDK gọi mạng.
+
+
+28.3 Local log
+
+Log:
+
+- app/runtime/model version;
+- hardware profile;
+- model load/unload;
+- stage timing;
+- input proxy resolution;
+- ROI count/size;
+- peak memory nếu đo được;
+- fallback/OOM;
+- export/preflight result;
+- RGB integrity result.
+
+Không log:
+
+- raw image pixels;
+- full filesystem path nếu không cần;
+- GPS/metadata riêng tư;
+- alpha tile payload.
+
+
+======================================================================
+29. PHASE 0 — QUALIFICATION BẮT BUỘC
+======================================================================
+
+Không bắt đầu full editor trước khi các gate dưới đây có prototype pass.
+
+
+29.1 Gate A — Canonical image/export proof
+
+- Decode PNG/JPEG/WebP.
+- EXIF orientation 1-8.
+- ICC/sRGB/CMYK conversion.
+- Existing alpha constraint.
+- Master RGB delta = 0.
+- POD-ready straight-alpha/sRGB.
+- Alpha-only 16-bit.
+
+
+29.2 Gate B — Model/platform proof
+
+Trên đúng GTX 1660 Super và MacBook M4:
+
+- BiRefNet dynamic/standard/lite.
+- SAM 2.1 Base+ conditional.
+- ViTMatte Base/Small ROI.
+- Candidate BEN2/FeyNoBg nếu license gate pass.
+- Parity, timing, memory, crash behavior.
+
+
+29.3 Gate C — Native Windows packaging proof
+
+Clean Windows 11 machine:
+
+- không Python cài sẵn;
+- không WSL;
+- không nvcc/CUDA toolkit;
+- không compiler;
+- CUDA inference hoạt động bằng bundled runtime;
+- CPU fallback hoạt động.
+
+
+29.4 Gate D — M4 recovery proof
+
+- MPS stage chạy nếu qualify.
+- Unsupported op được log.
+- OOM/fatal worker được restart.
+- CPU fallback riêng stage.
+- UI/project không crash/mất dữ liệu.
+
+
+29.5 Gate E — Native viewer/editor proof
+
+- 20-30 MP image.
+- Tile viewer >= 30 fps.
+- Brush 1 px đúng tọa độ tại 3200%.
+- Undo/redo tile delta.
+- Autosave/crash recovery.
+
+
+29.6 Gate F — License/model manifest
+
+- Exact revision/hash/license cho mọi artifact.
+- commercial_pod_allowed = true.
+- không trust_remote_code.
+- offline install pass.
+
+
+======================================================================
+30. IMPLEMENTATION PHASES
+======================================================================
+
+PHASE 0 — Qualification
+
+- Thực hiện toàn bộ gate section 29.
+- Chọn default model/profile dựa trên measured result.
+
+
+PHASE 1 — Canonical Core + Project Store
+
+- Image loader.
+- CanonicalImage.
+- Tile alpha store.
+- Project schema/journal/autosave.
+- Master/POD/Alpha export foundation.
+
+
+PHASE 2 — Desktop Shell + Viewer
+
+- Tauri/React/WebGL.
+- IPC/coordinator.
+- Tiled pan/zoom.
+- Preview modes.
+- Pixel grid/native coordinate tools.
+
+
+PHASE 3 — Artwork Extraction
+
+- Background Sample.
+- Color Range.
+- Magic Wand.
+- BiRefNet base proposal.
+- Component/topology analysis.
+- Uncertainty heuristic.
+
+
+PHASE 4 — Manual Editor
+
+- Brush/lasso/locks.
+- Undo/redo/history.
+- Component inspector.
+- Alpha levels/edge operations preview.
+
+
+PHASE 5 — Conditional AI Refine
+
+- SAM points/box/topology.
+- Trimap.
+- ViTMatte native ROI.
+- Local refine và seam validation.
+
+
+PHASE 6 — POD Export + Preflight
+
+- Effective PPI.
+- POD-ready edge treatment.
+- Halo/semi-alpha/speck checks.
+- Report.
+
+
+PHASE 7 — Hardening
+
+- Cross-platform packaging.
+- OOM/crash/disk-full recovery.
+- Offline/security tests.
+- Performance/quality regression.
+
+
+======================================================================
+31. BENCHMARK DATASET
+======================================================================
+
+31.1 Ownership
+
+- Tối thiểu 100 images do user sở hữu hoặc có quyền benchmark.
+- Không dùng output model làm ground truth.
+- Ground truth alpha được verify/sửa thủ công.
+- Không bundle dataset nếu license không cho phép.
+
+
+31.2 Category balance
+
+Tối thiểu 10 fixture/category cho:
+
+- hard-edge artwork;
+- typography/logo;
+- thin line art;
+- distressed/grunge texture;
+- disconnected components;
+- glow/semi-transparency;
+- gradient/anti-alias;
+- white/near-white background;
+- black/near-black background;
+- low contrast/complex background.
+
+
+31.3 Split
+
+- Development/calibration set.
+- Frozen holdout set.
+- Không tune threshold trực tiếp trên holdout.
+- Report metric theo category, không chỉ average.
+
+
+======================================================================
+32. QUALITY METRICS VÀ GATES
+======================================================================
+
+32.1 Metrics
+
+Segmentation/topology:
+
+- IoU;
+- Dice;
+- Precision;
+- Recall;
+- Boundary F1;
+- component recall;
+- hole/gap/component error.
+
+Matting:
+
+- SAD;
+- MSE/MAE;
+- Gradient Error;
+- Connectivity Error.
+
+Composite:
+
+- edge error trên white/black/gray/red/blue background;
+- halo detection sau scale/composite;
+- hidden RGB inspection.
+
+
+32.2 Required quality gates
+
+Hard-edge artwork:
+
+    Boundary F1 ±2 px >= 0.98
+    unknown-band alpha MAE <= 0.015
+
+Soft/complex artwork:
+
+    Boundary F1 ±4 px >= 0.93
+    alpha MAE <= 0.04
+
+Component:
+
+    recall cho component có kích thước >= 4 px >= 98%
+
+Uncertainty:
+
+    phát hiện >= 95% error regions có area >= 16 px
+    và |alpha_error| >= 0.25
+
+
+32.3 Regression rule
+
+- Không category nào bị che bởi điểm trung bình tốt.
+- Không merge release nếu category quan trọng regression vượt gate.
+- Accelerated backend phải pass parity section 13.4.
+
+
+======================================================================
+33. PERFORMANCE VÀ STABILITY ACCEPTANCE
+======================================================================
+
+33.1 Inference SLA
+
+Đo trên cả hai hardware reference.
+
+Dataset timing:
+
+- ít nhất 30 ảnh;
+- 20-30 MP;
+- app đã mở;
+- model chưa resident;
+- không tính download/first-run qualification.
+
+Targets:
+
+- FAST p95 <= 30 giây;
+- QUALITY p95 <= 90 giây;
+- Local refine ROI 512 p95 <= 10 giây;
+- Export PNG 30 MP p95 <= 15 giây.
+
+MAX và CPU fallback không có SLA.
+
+
+33.2 Editor SLA
+
+- Brush commit p95 <= 50 ms.
+- Undo/redo p95 <= 50 ms.
+- Pan/zoom >= 30 fps.
+- Progress/cancel UI responsive.
+
+
+33.3 Stability
+
+- 100 process/export jobs liên tiếp không crash app.
+- Worker OOM không làm mất project.
+- Crash giữa autosave giữ last valid snapshot.
+- Một corrupt tile/model/image không apply dữ liệu sai.
+
+
+======================================================================
+34. TEST MATRIX BẮT BUỘC
+======================================================================
+
+34.1 Image/color
+
+- PNG/JPEG/static WebP.
+- RGB/RGBA/grayscale/palette/CMYK converted.
+- Existing alpha.
+- EXIF orientation 1-8.
+- sRGB/Display P3/missing ICC/invalid ICC.
+- Unicode và long path.
+- 1 px, tiny, 20-30 MP và 40 MP boundary.
+- Decompression bomb/malformed image.
+
+
+34.2 Alpha/export
+
+- Master RGB integrity.
+- Hidden RGB khi alpha = 0.
+- Straight-alpha round-trip.
+- Alpha-only 16-bit.
+- POD-ready sRGB.
+- White/black/garment composite.
+- PPI calculation.
+- Trim/padding/canvas opt-in.
+- Source không bị overwrite.
+
+
+34.3 Editor/coordinates
+
+- Pixel-center/half-open rectangle.
+- HiDPI/devicePixelRatio.
+- Zoom 3200%.
+- Brush 1 px.
+- Lasso/magic wand native mapping.
+- Lock precedence.
+- Undo/redo/journal replay.
+- ROI overlap seam.
+
+
+34.4 Hardware/recovery
+
+- CUDA OOM.
+- MPS OOM/fatal worker.
+- CPU retry.
+- Cancel giữa stage.
+- Worker kill.
+- Disk full.
+- Corrupt/interrupted model download.
+- Model hash mismatch.
+- App restart giữa save/export.
+
+
+34.5 Security/offline
+
+- Clean Windows/macOS không Python/compiler.
+- Inference khi network bị chặn.
+- Malicious project/modelpack path traversal.
+- Symlink escape.
+- Oversized JSON/blob.
+- Frontend remote content bị chặn.
+
+
+======================================================================
+35. DEFINITION OF DONE V1
+======================================================================
+
+V1 hoàn tất khi:
+
+1. PHASE 0 pass trên GTX 1660 Super và MacBook M4.
+2. User import được artwork 8-bit supported.
+3. Canonical source/hash/orientation/ICC được lưu đúng.
+4. ARTWORK auto proposal giữ component/topology theo quality gate.
+5. Background sample/color range/magic wand hoạt động native-resolution.
+6. User sửa được chính xác 1 pixel và lock vùng đã chuẩn.
+7. Local AI refine không ghi đè lock/manual edit ngoài ROI.
+8. Project autosave/reopen không cần rerun AI.
+9. MASTER_SOURCE_FAITHFUL pass RGB delta 0.
+10. POD_READY là sRGB straight-alpha và có preview/preflight.
+11. ALPHA_ONLY là matte 16-bit native-resolution.
+12. FAST/QUALITY/editor performance đạt SLA.
+13. OOM/worker crash không làm sập app hoặc mất project.
+14. Normal workflow chạy hoàn toàn offline.
+15. Mọi production model có manifest/hash/license hợp lệ.
+
+
+======================================================================
+36. CẤU HÌNH MẶC ĐỊNH PROVISIONAL
+======================================================================
+
+36.1 Common
+
+    content_mode = ARTWORK
+    quality_preset = QUALITY
+    subject_policy = PRESERVE_COMPONENTS
+    output_master = MASTER_SOURCE_FAITHFUL
+    output_pod = POD_READY
+    alpha_internal = FLOAT32_TILED
+    output_alpha = UINT16
+    pod_png = RGBA8_SRGB_STRAIGHT_ALPHA
+    telemetry = OFF
+    offline_after_install = TRUE
+
+
+36.2 Windows GTX 1660 Super
+
+    backend = CUDA
+    base_model = BIREFNET_DYNAMIC_OR_STANDARD
+    base_resolution = 1024
+    base_dtype = FP16_IF_PARITY_PASS
+    base_fallback = BIREFNET_LITE
+    sam = SAM_2_1_BASE_PLUS_CONDITIONAL
+    vitmatte = VITMATTE_B_ROI_512
+    vitmatte_fallback = VITMATTE_S
+    heavy_models = SEQUENTIAL
+    max_stage_vram_target = 5.0_GIB
+
+
+36.3 MacBook M4
+
+    backend = PER_MODEL_QUALIFIED_MPS_OR_CPU
+    base_model = BIREFNET_DYNAMIC_OR_STANDARD
+    base_resolution = 1024_STARTING_PROFILE
+    dtype = PER_MODEL_PARITY_PROFILE
+    sam = CONDITIONAL
+    vitmatte = ROI_BASED
+    heavy_models = SEQUENTIAL
+    memory = DYNAMIC_UNIFIED_MEMORY_PROFILE
+
+
+36.4 Retry order
+
+    current profile
+      -> lower input/ROI profile
+      -> Lite/Small model fallback
+      -> CPU fallback with user-visible warning
+
+
+======================================================================
+37. V1.1 / SAU V1
+======================================================================
+
+Ưu tiên sau V1:
+
+1. Batch queue và review queue.
+2. Generic reusable canvas presets.
+3. Printful/Printify versioned presets.
+4. Sticker speck/cut-border workflow.
+5. Multi-object layers.
+6. Transferable shadow approximation.
+7. Glass/refraction experimental mode.
+8. 16-bit/TIFF/HEIC support.
+9. Provider/mockup/listing workflows.
+10. Core ML/ONNX/TensorRT sau parity benchmark.
+11. Active learning/fine-tune domain artwork.
+
+
+======================================================================
+38. RESEARCH VÀ NGUỒN THAM CHIẾU
+======================================================================
+
+PNG alpha representation:
+    https://www.w3.org/TR/png-3/
+
+BiRefNet official repository, model zoo và memory benchmark:
+    https://github.com/ZhengPeng7/BiRefNet
+
+BiRefNet HR-matting official model card:
+    https://huggingface.co/ZhengPeng7/BiRefNet_HR-matting
+
+BiRefNet dynamic-matting:
+    https://huggingface.co/ZhengPeng7/BiRefNet_dynamic-matting
+
+BiRefNet lite-matting:
+    https://huggingface.co/ZhengPeng7/BiRefNet_lite-matting
+
+SAM 2 official repository/install/license:
+    https://github.com/facebookresearch/sam2
+    https://github.com/facebookresearch/sam2/blob/main/INSTALL.md
+
+ViTMatte official repository:
+    https://github.com/hustvl/ViTMatte
+
+ViTMatte Transformers model:
+    https://huggingface.co/hustvl/vitmatte-base-composition-1k
+
+BRIA RMBG-2.0 non-commercial self-host license:
+    https://huggingface.co/briaai/RMBG-2.0
+
+BEN2 official repository:
+    https://github.com/PramaLLC/BEN2
+
+FeyNoBg official model card:
+    https://huggingface.co/feyninc/FeyNobg
+
+PyTorch MPS environment/memory variables:
+    https://docs.pytorch.org/docs/stable/mps_environment_variables.html
+
+Tauri sidecar và capability security:
+    https://v2.tauri.app/develop/sidecar/
+    https://v2.tauri.app/security/capabilities/
+
+Printful resolution/actual print size guidance:
+    https://help.printful.com/hc/en-us/articles/360014007920-What-is-DPI-resolution-and-actual-print-file-size
+
+Printify product-specific dimensions guidance:
+    https://help.printify.com/hc/en-us/articles/4483601892497-What-dimensions-should-my-design-be
+
+
+======================================================================
+39. FINAL PRODUCT PRINCIPLE
+======================================================================
+
+Khi có xung đột:
+
+1. Không làm mất artwork có chủ ý.
+2. Không thay đổi source/master RGB ngoài contract.
+3. Không giả vờ AI chắc chắn khi chỉ có heuristic.
+4. Không đổi quality hoặc backend âm thầm.
+5. Không đánh đổi project safety để lấy tốc độ.
+6. Không thêm model/chức năng nếu chưa benchmark trên hardware thật.
+
+Mục tiêu cuối:
+
+    LOCAL
+    FREE OF PAID API
+    COMMERCIAL-POD-COMPATIBLE MODELS
+    PIXEL-PRECISE
+    SOURCE-SAFE
+    ARTWORK-AWARE
+    POD-READY
