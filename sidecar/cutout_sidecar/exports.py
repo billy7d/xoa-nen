@@ -23,7 +23,8 @@ def _atomic_save(image: Image.Image, destination: Path, **save_options: Any) -> 
     temporary = Path(temporary_name)
     try:
         image.save(temporary, format="PNG", **save_options)
-        with temporary.open("rb") as stream:
+        # Windows chỉ cho fsync ổn định với handle có quyền ghi.
+        with temporary.open("r+b") as stream:
             os.fsync(stream.fileno())
         os.replace(temporary, destination)
     finally:

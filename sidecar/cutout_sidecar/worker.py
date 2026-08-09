@@ -25,7 +25,8 @@ def atomic_save_array(destination: Path, array: np.ndarray) -> None:
     temporary = Path(temporary_name)
     try:
         np.save(temporary, np.ascontiguousarray(array, dtype=np.float32), allow_pickle=False)
-        with temporary.open("rb") as stream:
+        # Windows chỉ cho fsync ổn định với handle có quyền ghi.
+        with temporary.open("r+b") as stream:
             os.fsync(stream.fileno())
         os.replace(temporary, destination)
     finally:

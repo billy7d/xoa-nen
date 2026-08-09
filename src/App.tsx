@@ -98,6 +98,21 @@ export default function App() {
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
+      // Khi Wand đang preview, Enter/Esc được ưu tiên để xác nhận hoặc hủy nhanh.
+      if (wandPreview && !busy && !event.repeat && !event.isComposing) {
+        if (event.key === "Enter") {
+          event.preventDefault();
+          event.stopPropagation();
+          void commitWand();
+          return;
+        }
+        if (event.key === "Escape") {
+          event.preventDefault();
+          event.stopPropagation();
+          void cancelWand();
+          return;
+        }
+      }
       if (event.target instanceof HTMLInputElement || event.target instanceof HTMLSelectElement) return;
       const mapping: Record<string, ToolMode> = {
         h: "pan", o: "subject", k: "keep", e: "remove", w: "wand-keep", s: "wand-remove",
@@ -313,7 +328,7 @@ export default function App() {
             <button className="empty-state" onClick={importImage}><span className="empty-art">✦</span><strong>Thả artwork vào đây</strong><span>PNG · JPEG · static WebP, tối đa bảo đảm 40 MP</span><em>Chọn ảnh</em></button>
           )}
           {busy && <div className="busy-overlay"><span className="spinner" />{busy}</div>}
-          {wandPreview && <div className="wand-preview-bar"><span>{wandPreview.selected_pixel_count.toLocaleString()} px được chọn</span><button onClick={commitWand}>Áp dụng</button><button onClick={() => cancelWand()}>Hủy</button></div>}
+          {wandPreview && <div className="wand-preview-bar"><span>{wandPreview.selected_pixel_count.toLocaleString()} px được chọn</span><button onClick={commitWand} title="Enter">Áp dụng ↵</button><button onClick={() => cancelWand()} title="Escape">Hủy Esc</button></div>}
           <div className="background-picker" aria-label="Nền preview">{(["checker", "white", "black", "garment"] as const).map((item) => <button key={item} className={`${item} ${background === item ? "active" : ""}`} onClick={() => setBackground(item)} title={`Nền ${item}`} />)}</div>
         </section>
 
