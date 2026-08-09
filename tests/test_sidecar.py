@@ -148,6 +148,21 @@ class CoordinatorFlowTests(unittest.TestCase):
         self.assertEqual(report["status"], "WARN")
         self.assertTrue(Path(report["report_path"]).is_file())
 
+        metric_report = self.coordinator.dispatch(
+            "preflight",
+            {
+                "project_id": project_id,
+                "print_width": 30.48,
+                "print_height": 25.4,
+                "print_unit": "cm",
+            },
+        )
+        self.assertEqual(metric_report["print_dimensions"]["unit"], "cm")
+        self.assertAlmostEqual(metric_report["print_dimensions"]["width_inch"], 12.0)
+        self.assertAlmostEqual(metric_report["print_dimensions"]["height_inch"], 10.0)
+        self.assertAlmostEqual(metric_report["effective_ppi"]["x"], 128 / 12)
+        self.assertAlmostEqual(metric_report["effective_ppi"]["y"], 96 / 10)
+
         export_directory = Path(self.temporary.name) / "exports"
         master_path = export_directory / "master.png"
         master = self.coordinator.dispatch(

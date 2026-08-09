@@ -16,6 +16,7 @@ def run_preflight(
     print_height_inch: float | None = None,
     color_profile: str = "sRGB",
     source_converted: bool = False,
+    print_unit: str = "inch",
 ) -> dict[str, Any]:
     warnings: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
@@ -76,15 +77,38 @@ def run_preflight(
         )
 
     effective_ppi = None
-    if print_width_inch and print_height_inch:
-        if print_width_inch <= 0 or print_height_inch <= 0:
+    print_dimensions = None
+    if print_width_inch is not None or print_height_inch is not None:
+        normalized_unit = print_unit.strip().lower()
+        if normalized_unit in {"in", "inches"}:
+            normalized_unit = "inch"
+
+        if normalized_unit not in {"inch", "cm"}:
+            failures.append(
+                {"code": "PRINT_UNIT_INVALID", "message": "Đơn vị kích thước in phải là inch hoặc cm"}
+            )
+        elif print_width_inch is None or print_height_inch is None:
+            failures.append(
+                {"code": "PRINT_SIZE_INVALID", "message": "Cần nhập đủ chiều rộng và chiều cao in"}
+            )
+        elif print_width_inch <= 0 or print_height_inch <= 0:
             failures.append(
                 {"code": "PRINT_SIZE_INVALID", "message": "Kích thước in phải lớn hơn 0"}
             )
         else:
+            unit_to_inch = 1.0 if normalized_unit == "inch" else 1.0 / 2.54
+            width_inch = float(print_width_inch) * unit_to_inch
+            height_inch = float(print_height_inch) * unit_to_inch
+            print_dimensions = {
+                "width": float(print_width_inch),
+                "height": float(print_height_inch),
+                "unit": normalized_unit,
+                "width_inch": width_inch,
+                "height_inch": height_inch,
+            }
             effective_ppi = {
-                "x": width / float(print_width_inch),
-                "y": height / float(print_height_inch),
+                "x": width / width_inch,
+                "y": height / height_inch,
             }
             if min(effective_ppi.values()) < 150:
                 warnings.append(
@@ -121,6 +145,7 @@ def run_preflight(
         "report_version": "preflight-v1",
         "status": status,
         "effective_ppi": effective_ppi,
+        "print_dimensions": print_dimensions,
         "pixel_dimensions": {"width": width, "height": height},
         "alpha_statistics": {
             "min": float(np.min(alpha)),
@@ -141,4 +166,3 @@ def run_preflight(
         "failures": failures,
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
-

@@ -67,7 +67,14 @@ export interface PreflightItem {
 
 export interface PreflightReport {
   status: "PASS" | "WARN" | "FAIL";
-  effective_ppi?: number;
+  effective_ppi?: { x: number; y: number } | null;
+  print_dimensions?: {
+    width: number;
+    height: number;
+    unit: "inch" | "cm";
+    width_inch: number;
+    height_inch: number;
+  } | null;
   warnings: Array<{ code: string; message: string; details?: unknown }>;
   failures: Array<{ code: string; message: string; details?: unknown }>;
   component_statistics: {

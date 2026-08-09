@@ -50,6 +50,7 @@ export default function App() {
   const [preflight, setPreflight] = useState<PreflightReport | null>(null);
   const [printWidth, setPrintWidth] = useState(12);
   const [printHeight, setPrintHeight] = useState(12);
+  const [printUnit, setPrintUnit] = useState<"inch" | "cm">("inch");
   const [trim, setTrim] = useState(false);
   const [padding, setPadding] = useState(0);
   const [panel, setPanel] = useState<"controls" | "preflight" | "export">("controls");
@@ -192,8 +193,9 @@ export default function App() {
       coordinatorCall<PreflightReport>("preflight", {
         project_id: project.project_id,
         output_mode: "POD_READY",
-        print_width_inch: printWidth,
-        print_height_inch: printHeight,
+        print_width: printWidth,
+        print_height: printHeight,
+        print_unit: printUnit,
       }),
     );
     if (result) {
@@ -225,8 +227,21 @@ export default function App() {
 
   const effectivePpi = useMemo(() => {
     if (!project || printWidth <= 0 || printHeight <= 0) return null;
-    return Math.floor(Math.min(project.width / printWidth, project.height / printHeight));
-  }, [printHeight, printWidth, project]);
+    const unitToInch = printUnit === "cm" ? 1 / 2.54 : 1;
+    return Math.floor(Math.min(
+      project.width / (printWidth * unitToInch),
+      project.height / (printHeight * unitToInch),
+    ));
+  }, [printHeight, printUnit, printWidth, project]);
+
+  const changePrintUnit = (unit: "inch" | "cm") => {
+    if (unit === printUnit) return;
+    const factor = unit === "cm" ? 2.54 : 1 / 2.54;
+    setPrintWidth(Number((printWidth * factor).toFixed(2)));
+    setPrintHeight(Number((printHeight * factor).toFixed(2)));
+    setPrintUnit(unit);
+    setPreflight(null);
+  };
 
   const installedModels = models.filter((model) => model.installed).length;
 
@@ -335,7 +350,8 @@ export default function App() {
             <div className="panel-content">
               <section className="control-section">
                 <h3>Kích thước in thực</h3>
-                <div className="two-columns"><label>Rộng (inch)<input type="number" min="0.1" step="0.25" value={printWidth} onChange={(event) => setPrintWidth(+event.target.value)} /></label><label>Cao (inch)<input type="number" min="0.1" step="0.25" value={printHeight} onChange={(event) => setPrintHeight(+event.target.value)} /></label></div>
+                <label>Đơn vị<select value={printUnit} onChange={(event) => changePrintUnit(event.target.value as "inch" | "cm")}><option value="inch">Inch</option><option value="cm">Centimet (cm)</option></select></label>
+                <div className="two-columns"><label>Rộng ({printUnit})<input type="number" min="0.1" step={printUnit === "cm" ? "0.1" : "0.25"} value={printWidth} onChange={(event) => setPrintWidth(+event.target.value)} /></label><label>Cao ({printUnit})<input type="number" min="0.1" step={printUnit === "cm" ? "0.1" : "0.25"} value={printHeight} onChange={(event) => setPrintHeight(+event.target.value)} /></label></div>
                 <div className={`ppi-card ${(effectivePpi ?? 0) < 150 ? "warn" : "good"}`}><span>Effective PPI</span><strong>{effectivePpi ?? "—"}</strong><small>Metadata 300 DPI không tăng chất lượng pixel.</small></div>
                 <button className="button primary full" onClick={runPreflight} disabled={!project || !!busy}>Chạy preflight</button>
               </section>
@@ -375,4 +391,3 @@ export default function App() {
     </main>
   );
 }
-

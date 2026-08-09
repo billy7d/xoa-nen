@@ -176,14 +176,23 @@ class Coordinator:
         manifest = self.store.manifest(project_id)
         alpha = self.store.read_alpha(project_id)
         source = manifest["source"]
+        uses_generic_size = "print_width" in params or "print_height" in params
+        print_width = (
+            params.get("print_width") if uses_generic_size else params.get("print_width_inch")
+        )
+        print_height = (
+            params.get("print_height") if uses_generic_size else params.get("print_height_inch")
+        )
+        print_unit = params.get("print_unit", "inch") if uses_generic_size else "inch"
         report = run_preflight(
             alpha,
             source["width"],
             source["height"],
-            params.get("print_width_inch"),
-            params.get("print_height_inch"),
+            print_width,
+            print_height,
             color_profile="sRGB",
             source_converted=bool(source.get("conversion_flags")),
+            print_unit=print_unit,
         )
         report["project_id"] = project_id
         report["output_mode"] = params.get("output_mode", "POD_READY")

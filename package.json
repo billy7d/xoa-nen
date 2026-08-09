@@ -10,8 +10,9 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "build:sidecar": "sh scripts/build-sidecar.sh",
+    "test:navigation": "node --experimental-strip-types --test tests/canvas_navigation.test.ts",
     "test:sidecar": "bash scripts/test-sidecar.sh",
-    "check": "npm run build && npm run test:sidecar"
+    "check": "npm run build && npm run test:navigation && npm run test:sidecar"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",

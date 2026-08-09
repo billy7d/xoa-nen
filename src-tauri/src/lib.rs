@@ -6,6 +6,46 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Manager, State};
 
+#[cfg(target_os = "macos")]
+use tauri::Emitter;
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, serde::Serialize)]
+struct MacosMagnifyPayload {
+    magnification: f64,
+    x: f64,
+    y: f64,
+}
+
+#[cfg(target_os = "macos")]
+fn install_macos_magnify_monitor(app: AppHandle) {
+    use block2::RcBlock;
+    use objc2_app_kit::{NSEvent, NSEventMask};
+    use std::ptr::NonNull;
+
+    let handler = RcBlock::new(move |event_ptr: NonNull<NSEvent>| -> *mut NSEvent {
+        let event = unsafe { event_ptr.as_ref() };
+        let location = event.locationInWindow();
+        let _ = app.emit(
+            "macos-preview-magnify",
+            MacosMagnifyPayload {
+                magnification: event.magnification(),
+                x: location.x,
+                y: location.y,
+            },
+        );
+        event_ptr.as_ptr()
+    });
+
+    // The monitor is owned by AppKit for the lifetime of the process. Keeping
+    // the token alive avoids WKWebView discarding native trackpad magnification.
+    if let Some(monitor) = unsafe {
+        NSEvent::addLocalMonitorForEventsMatchingMask_handler(NSEventMask::Magnify, &handler)
+    } {
+        std::mem::forget(monitor);
+    }
+}
+
 struct CoordinatorProcess {
     child: Child,
     stdin: ChildStdin,
@@ -193,6 +233,11 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(CoordinatorState::new())
+        .setup(|app| {
+            #[cfg(target_os = "macos")]
+            install_macos_magnify_monitor(app.handle().clone());
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![coordinator_request])
         .run(tauri::generate_context!())
         .expect("error while running Local POD Cutout Editor");

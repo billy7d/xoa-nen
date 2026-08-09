@@ -1663,6 +1663,8 @@ checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
 name = "local-pod-cutout-editor"
 version = "0.1.0"
 dependencies = [
+ "block2",
+ "objc2-app-kit",
  "serde",
  "serde_json",
  "tauri",

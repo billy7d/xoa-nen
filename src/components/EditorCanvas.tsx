@@ -1,6 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { localAssetUrl } from "../bridge";
+import { listen } from "@tauri-apps/api/event";
+import { isTauriRuntime, localAssetUrl } from "../bridge";
 import type { ProjectPayload, ToolMode } from "../types";
+import {
+  clamp,
+  normalizeWheelDelta,
+  zoomViewAt,
+  type NavigationView,
+} from "./canvasNavigation";
 
 interface Point {
   x: number;
@@ -23,6 +30,18 @@ interface ViewTransform {
   originY: number;
 }
 
+interface WebKitGestureEvent extends Event {
+  clientX: number;
+  clientY: number;
+  scale: number;
+}
+
+interface MacosMagnifyPayload {
+  magnification: number;
+  x: number;
+  y: number;
+}
+
 const checkerSize = 12;
 
 export default function EditorCanvas({
@@ -38,16 +57,45 @@ export default function EditorCanvas({
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const imageRef = useRef<HTMLImageElement | null>(null);
   const transformRef = useRef<ViewTransform>({ scale: 1, originX: 0, originY: 0 });
+  const drawRef = useRef<() => void>(() => undefined);
+  const viewRef = useRef<NavigationView>({ zoom: 1, pan: { x: 0, y: 0 } });
+  const frameRef = useRef<number | null>(null);
+  const gestureRef = useRef<{ lastScale: number; active: boolean }>({ lastScale: 1, active: false });
+  const hoverRef = useRef(false);
   const pointerRef = useRef<{
     id: number;
     mode: "pan" | "brush";
     last: Point;
     points: Point[];
   } | null>(null);
-  const [zoom, setZoom] = useState(1);
-  const [pan, setPan] = useState<Point>({ x: 0, y: 0 });
+  const [view, setView] = useState<NavigationView>(viewRef.current);
   const [cursor, setCursor] = useState<Point | null>(null);
   const [loading, setLoading] = useState(true);
+  const { zoom, pan } = view;
+
+  const scheduleView = useCallback((next: NavigationView) => {
+    viewRef.current = next;
+    if (frameRef.current !== null) return;
+    frameRef.current = window.requestAnimationFrame(() => {
+      frameRef.current = null;
+      setView(viewRef.current);
+    });
+  }, []);
+
+  const resetView = useCallback(() => {
+    scheduleView({ zoom: 1, pan: { x: 0, y: 0 } });
+  }, [scheduleView]);
+
+  const zoomAt = useCallback((clientX: number, clientY: number, factor: number) => {
+    const canvas = canvasRef.current;
+    if (!canvas || !Number.isFinite(factor) || factor <= 0) return;
+    const rect = canvas.getBoundingClientRect();
+    const pointer = {
+      x: Number.isFinite(clientX) ? clientX - rect.left : rect.width / 2,
+      y: Number.isFinite(clientY) ? clientY - rect.top : rect.height / 2,
+    };
+    scheduleView(zoomViewAt(viewRef.current, pointer, rect, factor));
+  }, [scheduleView]);
 
   const draw = useCallback(() => {
     const host = hostRef.current;
@@ -114,6 +162,7 @@ export default function EditorCanvas({
       ctx.fill();
     }
   }, [background, cursor, pan.x, pan.y, project.width, radius, tool, zoom]);
+  drawRef.current = draw;
 
   useEffect(() => {
     const image = new Image();
@@ -121,7 +170,6 @@ export default function EditorCanvas({
     image.onload = () => {
       imageRef.current = image;
       setLoading(false);
-      draw();
     };
     image.onerror = () => setLoading(false);
     image.src = localAssetUrl(project.preview_path, project.revision);
@@ -129,14 +177,138 @@ export default function EditorCanvas({
       image.onload = null;
       image.onerror = null;
     };
-  }, [project.preview_path, project.revision, draw]);
+  }, [project.preview_path, project.revision]);
 
   useEffect(() => {
-    const observer = new ResizeObserver(draw);
-    if (hostRef.current) observer.observe(hostRef.current);
     draw();
+  }, [draw, loading]);
+
+  useEffect(() => {
+    const observer = new ResizeObserver(() => drawRef.current());
+    const host = hostRef.current;
+    if (host) observer.observe(host);
     return () => observer.disconnect();
-  }, [draw]);
+  }, []);
+
+  useEffect(() => () => {
+    if (frameRef.current !== null) window.cancelAnimationFrame(frameRef.current);
+  }, []);
+
+  useEffect(() => {
+    const isMac = /Mac|iPhone|iPad|iPod/.test(navigator.platform || navigator.userAgent);
+    if (!isMac || !isTauriRuntime()) return;
+
+    const unlisten = listen<MacosMagnifyPayload>("macos-preview-magnify", ({ payload }) => {
+      const host = hostRef.current;
+      if (!host) return;
+      const rect = host.getBoundingClientRect();
+      const clientX = payload.x;
+      const clientY = window.innerHeight - payload.y;
+      const isInside = clientX >= rect.left
+        && clientX <= rect.right
+        && clientY >= rect.top
+        && clientY <= rect.bottom;
+      if (!isInside && !hoverRef.current) return;
+
+      const factor = Math.max(0.1, 1 + payload.magnification * 0.72);
+      zoomAt(clientX, clientY, factor);
+    });
+    return () => {
+      void unlisten.then((dispose) => dispose());
+    };
+  }, [zoomAt]);
+
+  useEffect(() => {
+    const host = hostRef.current;
+    if (!host) return;
+    const isMac = /Mac|iPhone|iPad|iPod/.test(navigator.platform || navigator.userAgent);
+    const usesNativeMagnify = isMac && isTauriRuntime();
+
+    const isOverPreview = (event: Event & { clientX?: number; clientY?: number }) => {
+      if (event.target instanceof Node && host.contains(event.target)) return true;
+      if (!Number.isFinite(event.clientX) || !Number.isFinite(event.clientY)) return false;
+      const rect = host.getBoundingClientRect();
+      return event.clientX! >= rect.left
+        && event.clientX! <= rect.right
+        && event.clientY! >= rect.top
+        && event.clientY! <= rect.bottom;
+    };
+
+    const onWheel = (event: WheelEvent) => {
+      if (!isOverPreview(event)) return;
+      event.preventDefault();
+      const delta = normalizeWheelDelta(
+        event.deltaX,
+        event.deltaY,
+        event.deltaMode,
+        host.clientHeight,
+      );
+      const wantsZoom = event.ctrlKey;
+
+      if (wantsZoom) {
+        // WebKit may emit both gesture and ctrl+wheel events for the same pinch.
+        if (gestureRef.current.active) return;
+        const limitedDelta = clamp(delta.y, -100, 100);
+        const sensitivity = isMac ? 0.004 : 0.00135;
+        zoomAt(event.clientX, event.clientY, Math.exp(-limitedDelta * sensitivity));
+        return;
+      }
+
+      const current = viewRef.current;
+      if (!isMac && event.shiftKey) {
+        const horizontalDelta = delta.x !== 0 ? delta.x : delta.y;
+        scheduleView({
+          zoom: current.zoom,
+          pan: { x: current.pan.x - horizontalDelta, y: current.pan.y },
+        });
+        return;
+      }
+
+      scheduleView({
+        zoom: current.zoom,
+        pan: { x: current.pan.x - delta.x, y: current.pan.y - delta.y },
+      });
+    };
+
+    // WKWebView exposes native macOS pinch through WebKit gesture events.
+    const onGestureStart = (rawEvent: Event) => {
+      if (usesNativeMagnify) return;
+      const event = rawEvent as WebKitGestureEvent;
+      if (!isOverPreview(event)) return;
+      event.preventDefault();
+      gestureRef.current = { lastScale: event.scale || 1, active: true };
+    };
+    const onGestureChange = (rawEvent: Event) => {
+      if (usesNativeMagnify) return;
+      const event = rawEvent as WebKitGestureEvent;
+      if (!gestureRef.current.active) return;
+      event.preventDefault();
+      const previous = gestureRef.current.lastScale || 1;
+      const current = event.scale || previous;
+      gestureRef.current.lastScale = current;
+      // Dampen WebKit's cumulative scale slightly for a controlled native feel.
+      zoomAt(event.clientX, event.clientY, Math.pow(current / previous, 0.72));
+    };
+    const onGestureEnd = (event: Event) => {
+      if (usesNativeMagnify) return;
+      if (!gestureRef.current.active) return;
+      event.preventDefault();
+      gestureRef.current = { lastScale: 1, active: false };
+    };
+
+    // Capture at window level: WKWebView can route macOS gestures to its scroll
+    // view before they bubble through the element beneath the pointer.
+    window.addEventListener("wheel", onWheel, { passive: false, capture: true });
+    window.addEventListener("gesturestart", onGestureStart, { passive: false, capture: true });
+    window.addEventListener("gesturechange", onGestureChange, { passive: false, capture: true });
+    window.addEventListener("gestureend", onGestureEnd, { passive: false, capture: true });
+    return () => {
+      window.removeEventListener("wheel", onWheel, true);
+      window.removeEventListener("gesturestart", onGestureStart, true);
+      window.removeEventListener("gesturechange", onGestureChange, true);
+      window.removeEventListener("gestureend", onGestureEnd, true);
+    };
+  }, [scheduleView, zoomAt]);
 
   const screenToCanonical = useCallback(
     (point: Point): Point | null => {
@@ -181,6 +353,7 @@ export default function EditorCanvas({
   };
 
   const onPointerMove = (event: React.PointerEvent) => {
+    hoverRef.current = true;
     const point = eventPoint(event);
     setCursor(point);
     const active = pointerRef.current;
@@ -188,7 +361,11 @@ export default function EditorCanvas({
     if (active.mode === "pan") {
       const dx = point.x - active.last.x;
       const dy = point.y - active.last.y;
-      setPan((current) => ({ x: current.x + dx, y: current.y + dy }));
+      const current = viewRef.current;
+      scheduleView({
+        zoom: current.zoom,
+        pan: { x: current.pan.x + dx, y: current.pan.y + dy },
+      });
       active.last = point;
       return;
     }
@@ -205,12 +382,6 @@ export default function EditorCanvas({
     canvasRef.current?.releasePointerCapture(event.pointerId);
   };
 
-  const onWheel = (event: React.WheelEvent) => {
-    event.preventDefault();
-    const factor = event.deltaY < 0 ? 1.13 : 1 / 1.13;
-    setZoom((current) => Math.min(32, Math.max(0.15, current * factor)));
-  };
-
   return (
     <div className="canvas-host" ref={hostRef}>
       <canvas
@@ -219,15 +390,14 @@ export default function EditorCanvas({
         onPointerMove={onPointerMove}
         onPointerUp={finishPointer}
         onPointerCancel={finishPointer}
-        onPointerLeave={() => setCursor(null)}
-        onWheel={onWheel}
+        onPointerEnter={() => { hoverRef.current = true; }}
+        onPointerLeave={() => { hoverRef.current = false; setCursor(null); }}
       />
       <div className="canvas-hud">
-        <button onClick={() => { setZoom(1); setPan({ x: 0, y: 0 }); }}>Vừa khung</button>
+        <button onClick={resetView}>Vừa khung</button>
         <span>{Math.round(zoom * 100)}%</span>
       </div>
       {loading && <div className="canvas-loading">Đang dựng preview…</div>}
     </div>
   );
 }
-
