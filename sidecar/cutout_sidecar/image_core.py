@@ -94,10 +94,10 @@ def decode_canonical(path: str | Path) -> CanonicalImage:
         source_format = (opened.format or "").upper()
         if source_format not in SUPPORTED_FORMATS:
             raise ValueError(
-                f"V1 chỉ hỗ trợ PNG, JPEG và static WebP; nhận được {source_format or opened.mode}"
+                f"Ứng dụng chỉ hỗ trợ PNG, JPEG và static WebP; nhận được {source_format or opened.mode}"
             )
         if getattr(opened, "is_animated", False):
-            raise ValueError("V1 không hỗ trợ ảnh động/multi-frame")
+            raise ValueError("Ứng dụng không hỗ trợ ảnh động/multi-frame")
 
         original_orientation = _orientation(opened)
         source_mode = opened.mode
@@ -172,6 +172,26 @@ def load_canonical_png(path: Path) -> tuple[np.ndarray, np.ndarray, bytes | None
     return rgb, source_alpha, icc
 
 
+def inference_srgb_copy(rgb: np.ndarray, icc_profile: bytes | None) -> tuple[np.ndarray, bool]:
+    """Return an sRGB inference buffer without mutating canonical source pixels."""
+    if not icc_profile:
+        return np.ascontiguousarray(rgb), False
+    try:
+        source_profile = ImageCms.ImageCmsProfile(BytesIO(icc_profile))
+        target_profile = ImageCms.createProfile("sRGB")
+        converted = ImageCms.profileToProfile(
+            Image.fromarray(rgb, "RGB"),
+            source_profile,
+            target_profile,
+            outputMode="RGB",
+        )
+        return np.ascontiguousarray(np.asarray(converted, dtype=np.uint8)), True
+    except (ImageCms.PyCMSError, OSError, ValueError):
+        # A broken profile must not make the editor unusable. Diagnostics expose
+        # the fallback so the output is never silently presented as color-managed.
+        return np.ascontiguousarray(rgb), False
+
+
 def preview_size(width: int, height: int, max_edge: int = PREVIEW_MAX_EDGE) -> tuple[int, int]:
     scale = min(1.0, max_edge / max(width, height))
     return max(1, round(width * scale)), max(1, round(height * scale))
@@ -196,4 +216,3 @@ def save_preview(
     rgba.putalpha(alpha_image)
     rgba.save(destination, format="PNG", compress_level=3)
     return target
-

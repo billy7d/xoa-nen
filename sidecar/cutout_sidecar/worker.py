@@ -10,7 +10,8 @@ from typing import Any, TextIO
 
 import numpy as np
 
-from .image_core import load_canonical_png
+from .image_core import inference_srgb_copy, load_canonical_png
+from .model_runtime import LocalModelRuntime
 from .processor import artwork_alpha
 
 
@@ -40,13 +41,42 @@ def process_request(request: dict[str, Any]) -> dict[str, Any]:
     output_path = Path(params["output_path"]).expanduser().resolve()
     if output_path.suffix.lower() != ".npy":
         raise ValueError("Worker output phải là file .npy trong project staging")
-    rgb, source_alpha, _ = load_canonical_png(canonical_path)
+    canonical_rgb, source_alpha, icc = load_canonical_png(canonical_path)
+    rgb, inference_color_converted = inference_srgb_copy(canonical_rgb, icc)
+    engine_profile = str(params.get("engine_profile", "V3_BALANCED")).upper()
+    runtime = LocalModelRuntime(
+        Path(params.get("models_dir") or canonical_path.parents[3] / "models").resolve()
+    )
+    semantic_alpha = None
+    semantic_diagnostics: dict[str, Any] = {"status": "not_requested"}
+    if engine_profile == "V3_AI_LOCAL":
+        semantic_alpha, semantic_diagnostics = runtime.semantic_proposal(rgb)
     alpha, diagnostics = artwork_alpha(
         rgb,
         source_alpha,
         tolerance=float(params.get("tolerance", 30.0)),
         softness=float(params.get("softness", 18.0)),
+        quality_preset=str(params.get("quality_preset", "QUALITY")),
+        engine_profile=engine_profile,
+        semantic_alpha=semantic_alpha,
     )
+    matting_diagnostics: dict[str, Any] = {"status": "not_requested"}
+    if engine_profile == "V3_AI_LOCAL" and semantic_alpha is not None:
+        alpha, matting_diagnostics = runtime.refine_unknown(rgb, alpha, source_alpha)
+    ai_models_used = [
+        item["model_id"]
+        for item in (semantic_diagnostics, matting_diagnostics)
+        if item.get("status") == "ok" and item.get("model_id")
+    ]
+    diagnostics["inference_srgb_copy"] = bool(inference_color_converted)
+    diagnostics["ai_runtime"] = {
+        "semantic": semantic_diagnostics,
+        "matting": matting_diagnostics,
+    }
+    diagnostics["ai_models_used"] = ai_models_used
+    if engine_profile == "V3_AI_LOCAL" and semantic_alpha is None:
+        diagnostics["fallback_reason"] = semantic_diagnostics.get("status", "ai_unavailable")
+        diagnostics["selected_strategy"] += "+ai_fallback"
     if not np.all(np.isfinite(alpha)):
         raise ValueError("Worker tạo alpha NaN/Inf")
     atomic_save_array(output_path, alpha)
@@ -89,4 +119,3 @@ def serve_worker_stdio(
 
 if __name__ == "__main__":
     serve_worker_stdio()
-

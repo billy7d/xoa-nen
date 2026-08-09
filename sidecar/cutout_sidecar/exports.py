@@ -55,21 +55,43 @@ def _convert_to_srgb(rgb: np.ndarray, icc_profile: bytes | None) -> np.ndarray:
 def _decontaminate_edges(
     rgb: np.ndarray,
     alpha: np.ndarray,
-    background_rgb: list[float] | None,
+    background_rgb: list[float] | list[list[float]] | dict[str, Any] | None,
 ) -> np.ndarray:
     if not background_rgb:
         return rgb
     result = rgb.astype(np.float32)
-    background = np.asarray(background_rgb, dtype=np.float32).reshape(1, 1, 3)
     fractional = (alpha > 0.03) & (alpha < 0.98)
     if not np.any(fractional):
         return rgb
-    alpha3 = np.maximum(alpha[:, :, None], 0.03)
-    estimated = (result - (1.0 - alpha3) * background) / alpha3
+    observed = result[fractional]
+    if isinstance(background_rgb, dict) and background_rgb.get("coefficients_linear"):
+        ys, xs = np.nonzero(fractional)
+        x = (xs.astype(np.float32) / max(1, rgb.shape[1] - 1)) * 2.0 - 1.0
+        y = (ys.astype(np.float32) / max(1, rgb.shape[0] - 1)) * 2.0 - 1.0
+        order = int(background_rgb.get("order", 0))
+        if order == 0:
+            design = np.ones((x.size, 1), dtype=np.float32)
+        elif order == 1:
+            design = np.stack((np.ones_like(x), x, y), axis=1)
+        else:
+            design = np.stack((np.ones_like(x), x, y, x * y, x * x, y * y), axis=1)
+        coefficients = np.asarray(background_rgb["coefficients_linear"], dtype=np.float32)
+        linear = np.clip(design @ coefficients, 0.0, 1.0)
+        srgb = np.where(
+            linear <= 0.0031308,
+            linear * 12.92,
+            1.055 * np.power(linear, 1.0 / 2.4) - 0.055,
+        )
+        background = np.clip(srgb * 255.0, 0.0, 255.0)
+    else:
+        palette = np.asarray(background_rgb, dtype=np.float32).reshape(-1, 3)
+        distances = np.sum(np.square(observed[:, None, :] - palette[None, :, :]), axis=2)
+        background = palette[np.argmin(distances, axis=1)]
+    fractional_alpha = np.maximum(alpha[fractional, None], 0.03)
+    estimated = (observed - (1.0 - fractional_alpha) * background) / fractional_alpha
     estimated = np.clip(estimated, 0.0, 255.0)
-    blend = np.clip((0.98 - alpha) / 0.95, 0.0, 1.0)[:, :, None] * 0.85
-    mask = fractional[:, :, None]
-    result = np.where(mask, result * (1.0 - blend) + estimated * blend, result)
+    blend = np.clip((0.98 - alpha[fractional, None]) / 0.95, 0.0, 1.0) * 0.85
+    result[fractional] = observed * (1.0 - blend) + estimated * blend
     return np.rint(np.clip(result, 0.0, 255.0)).astype(np.uint8)
 
 
@@ -111,7 +133,7 @@ def _place_on_canvas(
     canvas_width = int(canvas.get("width", rgb.shape[1]))
     canvas_height = int(canvas.get("height", rgb.shape[0]))
     if canvas_width < rgb.shape[1] or canvas_height < rgb.shape[0]:
-        raise ValueError("Canvas nhỏ hơn artwork; V1 không tự scale hoặc clip")
+        raise ValueError("Canvas nhỏ hơn artwork; ứng dụng không tự scale hoặc clip")
     out_rgb = np.zeros((canvas_height, canvas_width, 3), dtype=np.uint8)
     out_alpha = np.zeros((canvas_height, canvas_width), dtype=np.float32)
     x = (canvas_width - rgb.shape[1]) // 2
@@ -127,7 +149,7 @@ def export_image(
     rgb: np.ndarray,
     alpha: np.ndarray,
     icc_profile: bytes | None,
-    background_rgb: list[float] | None = None,
+    background_rgb: list[float] | list[list[float]] | dict[str, Any] | None = None,
     settings: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if output_mode not in OUTPUT_MODES:

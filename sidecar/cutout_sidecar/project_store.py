@@ -15,7 +15,7 @@ import numpy as np
 from .image_core import CanonicalImage, save_canonical_png, save_preview
 
 
-SCHEMA_VERSION = "2.2.0"
+SCHEMA_VERSION = "3.0.0"
 TILE_SIZE = 512
 
 
@@ -98,7 +98,7 @@ class ProjectStore:
 
         manifest = {
             "schema_version": SCHEMA_VERSION,
-            "app_version": "0.1.0",
+            "app_version": "0.3.0",
             "project_id": project_id,
             "created_at": utc_now(),
             "updated_at": utc_now(),
@@ -135,7 +135,26 @@ class ProjectStore:
         manifest_path = self.path(project_id) / "manifest.json"
         if not manifest_path.is_file():
             raise FileNotFoundError(f"Không tìm thấy project {project_id}")
-        return json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if manifest.get("schema_version") != SCHEMA_VERSION:
+            # V3 migration is metadata-only: existing alpha tiles, locks, history,
+            # source pixels and export settings remain byte-for-byte untouched.
+            processing = manifest.get("processing")
+            if isinstance(processing, dict):
+                diagnostics = processing.setdefault("diagnostics", {})
+                old_engine = diagnostics.get("engine")
+                processing.setdefault(
+                    "engine_profile",
+                    "LEGACY_V1" if old_engine == "classical-artwork-v1" else "V2_ARCHIVED_RESULT",
+                )
+                processing.setdefault("subjects", [])
+                processing.setdefault("selected_subject_ids", [])
+                processing.setdefault("review_regions", [])
+                processing.setdefault("warnings", [])
+            manifest["schema_version"] = SCHEMA_VERSION
+            manifest["app_version"] = "0.3.0"
+            atomic_write_json(manifest_path, manifest)
+        return manifest
 
     def update_manifest(self, project_id: str, manifest: dict[str, Any]) -> None:
         manifest["updated_at"] = utc_now()
@@ -305,4 +324,3 @@ class ProjectStore:
             shutil.rmtree(delta_dir)
         delta_dir.mkdir(parents=True)
         atomic_write_bytes(self.path(project_id) / "journal" / "edits.jsonl", b"")
-

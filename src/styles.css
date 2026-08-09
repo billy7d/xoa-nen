@@ -69,6 +69,9 @@ button { color: inherit; }
 .background-picker button.active { outline: 2px solid var(--green); outline-offset: 1px; }
 .background-picker .checker { background: conic-gradient(#aaa 25%, #ddd 0 50%, #aaa 0 75%, #ddd 0) 0 0/10px 10px; }
 .background-picker .white { background: white; }.background-picker .black { background: #050505; }.background-picker .garment { background: #263a58; }
+.wand-preview-bar { position: absolute; top: 12px; left: 50%; z-index: 8; display: flex; align-items: center; gap: 7px; padding: 7px 9px; transform: translateX(-50%); color: #e8eee9; background: rgba(23, 28, 25, .94); border: 1px solid #4d5a52; border-radius: 8px; box-shadow: 0 8px 28px rgba(0, 0, 0, .28); font-size: 10px; }
+.wand-preview-bar button { padding: 5px 9px; color: #07130d; background: var(--green); border: 0; border-radius: 5px; cursor: pointer; font-size: 9px; font-weight: 750; }
+.wand-preview-bar button:last-child { color: #dfe7e2; background: #343b37; }
 
 .inspector { min-width: 0; overflow: hidden; background: var(--panel); border-left: 1px solid var(--line); }
 .panel-tabs { display: grid; grid-template-columns: repeat(3, 1fr); height: 42px; padding: 5px; border-bottom: 1px solid var(--line); }
@@ -97,6 +100,16 @@ input[type="range"] { width: 100%; height: 4px; accent-color: var(--green); }
 .stats-grid span { display: flex; flex-direction: column; gap: 4px; padding: 8px; color: var(--muted); background: #222725; border-radius: 6px; font-size: 8px; }
 .stats-grid b { color: #e6eee9; font-size: 15px; }
 .model-card p { margin: 0; color: var(--muted); font-size: 10px; line-height: 1.5; }
+.model-import { margin-top: 11px; }
+.installed-model { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 8px; padding: 8px; background: #222725; border-radius: 6px; font-size: 9px; }
+.installed-model span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.installed-model small { display: block; margin-top: 3px; color: var(--muted); font-size: 7px; }
+.installed-model button, .subject-actions button, .text-button { padding: 5px 7px; color: #cbd6d0; background: #303632; border: 1px solid #424a45; border-radius: 5px; cursor: pointer; font-size: 8px; }
+.text-button { margin-top: 8px; background: transparent; border-color: transparent; color: var(--green); }
+.subject-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
+.review-card { color: #f0d38a; background: #292418; }
+.review-card h3 { margin-bottom: 7px; }
+.review-card p { margin: 4px 0; color: #d8c69a; font-size: 9px; line-height: 1.4; }
 .two-columns { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 .ppi-card { display: grid; grid-template-columns: 1fr auto; gap: 3px; padding: 11px; margin: 6px 0 13px; border: 1px solid; border-radius: 8px; }
 .ppi-card span { font-size: 10px; }.ppi-card strong { font-size: 18px; }.ppi-card small { grid-column: 1/-1; color: var(--muted); font-size: 8px; }

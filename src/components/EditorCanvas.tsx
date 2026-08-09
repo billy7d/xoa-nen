@@ -22,6 +22,7 @@ interface Props {
   disabled?: boolean;
   onBrush: (points: Point[]) => Promise<void>;
   onWand: (point: Point) => Promise<void>;
+  onSubject: (point: Point) => Promise<void>;
 }
 
 interface ViewTransform {
@@ -52,6 +53,7 @@ export default function EditorCanvas({
   disabled,
   onBrush,
   onWand,
+  onSubject,
 }: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -148,6 +150,30 @@ export default function EditorCanvas({
     ctx.lineWidth = 1;
     ctx.strokeRect(originX - 0.5, originY - 0.5, displayWidth + 1, displayHeight + 1);
 
+    const drawBox = (bbox: [number, number, number, number], color: string, dashed: boolean) => {
+      const [x0, y0, x1, y1] = bbox;
+      ctx.save();
+      ctx.strokeStyle = color;
+      ctx.fillStyle = `${color}22`;
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash(dashed ? [6, 4] : []);
+      const left = originX + (x0 / project.width) * displayWidth;
+      const top = originY + (y0 / project.height) * displayHeight;
+      const boxWidth = ((x1 - x0) / project.width) * displayWidth;
+      const boxHeight = ((y1 - y0) / project.height) * displayHeight;
+      ctx.fillRect(left, top, boxWidth, boxHeight);
+      ctx.strokeRect(left, top, boxWidth, boxHeight);
+      ctx.restore();
+    };
+    for (const region of project.process?.review_regions ?? []) {
+      drawBox(region.bbox, "#f2c14f", true);
+    }
+    if (tool === "subject") {
+      for (const subject of project.process?.subjects ?? []) {
+        drawBox(subject.bbox, subject.selected ? "#61e59e" : "#ff7185", false);
+      }
+    }
+
     if (cursor && (tool === "keep" || tool === "remove")) {
       const previewRatio = image.naturalWidth / project.width;
       const brushRadius = radius * previewRatio * scale;
@@ -161,7 +187,7 @@ export default function EditorCanvas({
       ctx.fillStyle = ctx.strokeStyle;
       ctx.fill();
     }
-  }, [background, cursor, pan.x, pan.y, project.width, radius, tool, zoom]);
+  }, [background, cursor, pan.x, pan.y, project.height, project.process, project.width, radius, tool, zoom]);
   drawRef.current = draw;
 
   useEffect(() => {
@@ -345,6 +371,10 @@ export default function EditorCanvas({
     if (!canonical) return;
     if (tool === "wand-keep" || tool === "wand-remove") {
       await onWand(canonical);
+      return;
+    }
+    if (tool === "subject") {
+      await onSubject(canonical);
       return;
     }
     if (tool === "keep" || tool === "remove") {

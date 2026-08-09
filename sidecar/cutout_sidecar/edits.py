@@ -100,8 +100,39 @@ def apply_magic_wand(
     softness: float,
     contiguous: bool,
     mode: str,
+    algorithm: str = "SMART",
 ) -> tuple[np.ndarray, tuple[int, int, int, int], dict[str, Any]]:
-    selection = magic_wand_selection(rgb, x, y, tolerance, softness, contiguous)
+    selection = magic_wand_selection(
+        rgb, x, y, tolerance, softness, contiguous, algorithm=algorithm
+    )
+    return apply_wand_coverage(
+        alpha,
+        source_alpha,
+        locks,
+        selection,
+        mode,
+        {
+            "x": int(x),
+            "y": int(y),
+            "tolerance": float(tolerance),
+            "softness": float(softness),
+            "contiguous": bool(contiguous),
+            "wand_algorithm": str(algorithm).upper(),
+        },
+    )
+
+
+def apply_wand_coverage(
+    alpha: np.ndarray,
+    source_alpha: np.ndarray,
+    locks: np.ndarray,
+    selection: np.ndarray,
+    mode: str,
+    metadata: dict[str, Any] | None = None,
+) -> tuple[np.ndarray, tuple[int, int, int, int], dict[str, Any]]:
+    if selection.shape != alpha.shape:
+        raise ValueError("Wand selection không cùng kích thước alpha")
+    selection = np.clip(selection.astype(np.float32), 0.0, 1.0)
     selection *= locks == 0
     result = alpha.copy()
     if mode == "remove":
@@ -119,11 +150,7 @@ def apply_magic_wand(
     operation = {
         "tool": "magic_wand",
         "mode": mode,
-        "x": int(x),
-        "y": int(y),
-        "tolerance": float(tolerance),
-        "softness": float(softness),
-        "contiguous": bool(contiguous),
-        "algorithm_version": "magic-wand-v1",
+        "algorithm_version": "magic-wand-link-cost-v3",
+        **(metadata or {}),
     }
     return result, bounds, operation

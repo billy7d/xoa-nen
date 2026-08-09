@@ -1,6 +1,6 @@
 [package]
 name = "local-pod-cutout-editor"
-version = "0.1.0"
+version = "0.3.0"
 description = "Local pixel-accurate POD cutout editor"
 authors = ["Local POD Cutout Editor contributors"]
 edition = "2021"

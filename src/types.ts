@@ -3,7 +3,26 @@ export type OutputMode =
   | "POD_READY"
   | "ALPHA_ONLY";
 
-export type ToolMode = "pan" | "keep" | "remove" | "wand-keep" | "wand-remove";
+export type EngineProfile = "LEGACY_V1" | "V3_BALANCED" | "V3_AI_LOCAL";
+export type WandAlgorithm = "LEGACY_COLOR" | "SMART";
+export type SubjectPolicy = "ALL_DETECTED" | "SELECTED";
+export type QualityPreset = "FAST" | "QUALITY";
+export type ToolMode = "pan" | "subject" | "keep" | "remove" | "wand-keep" | "wand-remove";
+
+export interface SubjectCandidate {
+  id: number;
+  area_px: number;
+  bbox: [number, number, number, number];
+  needs_review: boolean;
+  selected: boolean;
+  confidence: "detected" | "review";
+}
+
+export interface ReviewRegion {
+  bbox: [number, number, number, number];
+  area_proxy: number;
+  reason: string;
+}
 
 export interface CanonicalImage {
   raw_hash: string;
@@ -50,10 +69,14 @@ export interface ProjectPayload {
   components?: ComponentSummary;
   process?: {
     content_mode: string;
-    quality_preset: string;
-    subject_policy: string;
+    engine_profile: EngineProfile | "V2_ARCHIVED_RESULT";
+    quality_preset: QualityPreset;
+    subject_policy: SubjectPolicy;
     diagnostics: Record<string, unknown>;
     ai_models_used: string[];
+    subjects: SubjectCandidate[];
+    selected_subject_ids: number[];
+    review_regions: ReviewRegion[];
   } | null;
   warnings?: string[];
 }
@@ -99,6 +122,21 @@ export interface ModelManifest {
   qualified_backends: string[];
   installed: boolean;
   status: string;
+  role?: string;
+  adapter?: string;
+  download_url?: string | null;
+  signature_valid?: boolean;
+  checksum_valid?: boolean;
+  policy_valid?: boolean;
+}
+
+export interface WandPreview {
+  selection_id: string;
+  preview_path: string;
+  selected_pixel_count: number;
+  bounds: [number, number, number, number];
+  mode: "keep" | "remove";
+  wand_algorithm: WandAlgorithm;
 }
 
 export interface HealthPayload {

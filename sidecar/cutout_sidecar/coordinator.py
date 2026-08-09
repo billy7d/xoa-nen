@@ -11,12 +11,22 @@ import numpy as np
 from PIL import Image
 
 from . import __version__
-from .edits import apply_brush, apply_magic_wand
+from .edits import apply_brush, apply_magic_wand, apply_wand_coverage
 from .exports import export_image
-from .image_core import decode_canonical, load_canonical_png, save_preview
-from .models import list_model_manifests
+from .image_core import (
+    decode_canonical,
+    inference_srgb_copy,
+    load_canonical_png,
+    save_preview,
+)
+from .models import (
+    download_model_pack,
+    install_model_pack,
+    list_model_manifests,
+    remove_model_pack,
+)
 from .preflight import run_preflight
-from .processor import analyze_components
+from .processor import analyze_components, magic_wand_selection, select_components
 from .project_store import ProjectStore, atomic_write_json
 from .worker_supervisor import WorkerSupervisor
 
@@ -37,11 +47,18 @@ class Coordinator:
             "process_artwork": self.process_artwork,
             "apply_brush": self.brush,
             "apply_magic_wand": self.magic_wand,
+            "preview_magic_wand": self.preview_magic_wand,
+            "commit_magic_wand": self.commit_magic_wand,
+            "cancel_magic_wand": self.cancel_magic_wand,
+            "set_subject_selection": self.set_subject_selection,
             "undo": self.undo,
             "redo": self.redo,
             "preflight": self.preflight,
             "export": self.export,
             "list_models": self.list_models,
+            "install_model_pack": self.install_model_pack,
+            "download_model_pack": self.download_model_pack,
+            "remove_model_pack": self.remove_model_pack,
         }
         handler = handlers.get(method)
         if not handler:
@@ -56,7 +73,7 @@ class Coordinator:
             "platform": platform.platform(),
             "python": platform.python_version(),
             "projects_dir": str(self.store.root),
-            "processing_engine": "classical-artwork-v1",
+            "processing_engine": "hybrid-cutout-v3",
         }
 
     def import_image(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -71,6 +88,10 @@ class Coordinator:
     def process_artwork(self, params: dict[str, Any]) -> dict[str, Any]:
         project_id = params["project_id"]
         rgb, _, _ = load_canonical_png(self.store.canonical_path(project_id))
+        engine_profile = str(params.get("engine_profile", "V3_BALANCED")).upper()
+        subject_policy = str(params.get("subject_policy", "ALL_DETECTED")).upper()
+        if subject_policy not in {"ALL_DETECTED", "SELECTED"}:
+            raise ValueError("Subject policy không hợp lệ")
         staging_path = self.store.path(project_id) / "alpha" / "staging" / "worker-alpha.npy"
         worker_result = self.worker.request(
             "process_artwork",
@@ -79,6 +100,9 @@ class Coordinator:
                 "output_path": str(staging_path),
                 "tolerance": float(params.get("tolerance", 30.0)),
                 "softness": float(params.get("softness", 18.0)),
+                "quality_preset": str(params.get("quality_preset", "QUALITY")),
+                "engine_profile": engine_profile,
+                "models_dir": str(self.models_dir),
             },
         )
         try:
@@ -92,19 +116,37 @@ class Coordinator:
         self.store.write_alpha(project_id, "base", alpha)
         self.store.write_alpha(project_id, "current", alpha)
         self.store.reset_history(project_id)
+        subjects = analyze_components(alpha)
+        for subject in subjects:
+            subject["selected"] = True
+            subject["confidence"] = "review" if subject["needs_review"] else "detected"
+        warnings: list[dict[str, Any]] = []
+        if engine_profile == "V3_AI_LOCAL" and not diagnostics.get("ai_models_used"):
+            warnings.append(
+                {
+                    "code": "AI_LOCAL_FALLBACK",
+                    "message": "Gói AI chưa sẵn sàng; đã fallback an toàn sang V3 Cân bằng.",
+                }
+            )
+        if diagnostics.get("needs_review"):
+            warnings.append(
+                {
+                    "code": "CUTOUT_NEEDS_REVIEW",
+                    "message": "Các candidate chưa đồng thuận; hãy kiểm tra vùng màu vàng hoặc chọn vật thể.",
+                }
+            )
         manifest = self.store.manifest(project_id)
         manifest["processing"] = {
-            "content_mode": "ARTWORK",
-            "quality_preset": params.get("quality_preset", "QUALITY"),
-            "subject_policy": "PRESERVE_COMPONENTS",
+            "content_mode": "AUTO",
+            "engine_profile": engine_profile,
+            "quality_preset": diagnostics["quality_preset"],
+            "subject_policy": subject_policy,
             "diagnostics": diagnostics,
-            "ai_models_used": [],
-            "warnings": [
-                {
-                    "code": "AI_MODELS_NOT_INSTALLED",
-                    "message": "Đang dùng Artwork Color/Edge engine local. Model AI sẽ được bật sau qualification/install.",
-                }
-            ],
+            "ai_models_used": diagnostics.get("ai_models_used", []),
+            "subjects": subjects[:100],
+            "selected_subject_ids": [int(subject["id"]) for subject in subjects],
+            "review_regions": diagnostics.get("review_regions", []),
+            "warnings": warnings,
         }
         self.store.update_manifest(project_id, manifest)
         self._refresh_preview(project_id, rgb, alpha)
@@ -132,7 +174,8 @@ class Coordinator:
 
     def magic_wand(self, params: dict[str, Any]) -> dict[str, Any]:
         project_id = params["project_id"]
-        rgb, source_alpha, _ = load_canonical_png(self.store.canonical_path(project_id))
+        canonical_rgb, source_alpha, icc = load_canonical_png(self.store.canonical_path(project_id))
+        rgb, _ = inference_srgb_copy(canonical_rgb, icc)
         before = self.store.read_alpha(project_id)
         locks = self.store.read_lock(project_id)
         after, bounds, operation = apply_magic_wand(
@@ -146,8 +189,118 @@ class Coordinator:
             float(params.get("softness", 18.0)),
             bool(params.get("contiguous", True)),
             params.get("mode", "remove"),
+            params.get("wand_algorithm", "SMART"),
         )
         self.store.commit_alpha_edit(project_id, before, after, bounds, operation)
+        self._refresh_preview(project_id, canonical_rgb, after)
+        return self._project_payload(project_id)
+
+    def preview_magic_wand(self, params: dict[str, Any]) -> dict[str, Any]:
+        project_id = params["project_id"]
+        canonical_rgb, source_alpha, icc = load_canonical_png(self.store.canonical_path(project_id))
+        inference_rgb, _ = inference_srgb_copy(canonical_rgb, icc)
+        selection = magic_wand_selection(
+            inference_rgb,
+            int(params["x"]),
+            int(params["y"]),
+            float(params.get("tolerance", 30.0)),
+            float(params.get("softness", 18.0)),
+            bool(params.get("contiguous", True)),
+            algorithm=params.get("wand_algorithm", "SMART"),
+        )
+        token = uuid.uuid4().hex
+        staging = self.store.path(project_id) / "alpha" / "staging"
+        staging.mkdir(parents=True, exist_ok=True)
+        selection_path = staging / f"wand-{token}.npy"
+        np.save(selection_path, selection.astype(np.float32), allow_pickle=False)
+        before = self.store.read_alpha(project_id)
+        locks = self.store.read_lock(project_id)
+        preview_alpha, bounds, _ = apply_wand_coverage(
+            before,
+            source_alpha,
+            locks,
+            selection,
+            params.get("mode", "remove"),
+        )
+        preview_path = self.store.preview_path(project_id, f"wand-preview-{token}")
+        save_preview(canonical_rgb, preview_alpha, preview_path)
+        return {
+            "selection_id": token,
+            "preview_path": str(preview_path.resolve()),
+            "selected_pixel_count": int(np.count_nonzero(selection > 0.001)),
+            "bounds": list(bounds),
+            "mode": params.get("mode", "remove"),
+            "wand_algorithm": str(params.get("wand_algorithm", "SMART")).upper(),
+        }
+
+    def commit_magic_wand(self, params: dict[str, Any]) -> dict[str, Any]:
+        project_id = params["project_id"]
+        token = str(params["selection_id"])
+        if len(token) != 32 or any(char not in "0123456789abcdef" for char in token.lower()):
+            raise ValueError("selection_id không hợp lệ")
+        selection_path = self.store.path(project_id) / "alpha" / "staging" / f"wand-{token}.npy"
+        if not selection_path.is_file():
+            raise FileNotFoundError("Wand preview đã hết hạn hoặc không tồn tại")
+        selection = np.load(selection_path, allow_pickle=False)
+        canonical_rgb, source_alpha, _ = load_canonical_png(self.store.canonical_path(project_id))
+        before = self.store.read_alpha(project_id)
+        locks = self.store.read_lock(project_id)
+        after, bounds, operation = apply_wand_coverage(
+            before,
+            source_alpha,
+            locks,
+            selection,
+            params.get("mode", "remove"),
+            {
+                "selection_id": token,
+                "wand_algorithm": str(params.get("wand_algorithm", "SMART")).upper(),
+                "selected_pixel_count": int(np.count_nonzero(selection > 0.001)),
+            },
+        )
+        self.store.commit_alpha_edit(project_id, before, after, bounds, operation)
+        selection_path.unlink(missing_ok=True)
+        self.store.preview_path(project_id, f"wand-preview-{token}").unlink(missing_ok=True)
+        self._refresh_preview(project_id, canonical_rgb, after)
+        return self._project_payload(project_id)
+
+    def cancel_magic_wand(self, params: dict[str, Any]) -> dict[str, Any]:
+        project_id = params["project_id"]
+        token = str(params["selection_id"])
+        if len(token) != 32 or any(char not in "0123456789abcdef" for char in token.lower()):
+            raise ValueError("selection_id không hợp lệ")
+        self.store.path(project_id).joinpath("alpha", "staging", f"wand-{token}.npy").unlink(
+            missing_ok=True
+        )
+        self.store.preview_path(project_id, f"wand-preview-{token}").unlink(missing_ok=True)
+        return {"cancelled": True, "selection_id": token}
+
+    def set_subject_selection(self, params: dict[str, Any]) -> dict[str, Any]:
+        project_id = params["project_id"]
+        selected_ids = {int(value) for value in params.get("selected_subject_ids", [])}
+        base = self.store.read_alpha(project_id, "base")
+        before = self.store.read_alpha(project_id)
+        after = select_components(base, selected_ids)
+        operation = {
+            "tool": "subject_selection",
+            "selected_subject_ids": sorted(selected_ids),
+            "algorithm_version": "component-selection-v3",
+        }
+        self.store.commit_alpha_edit(
+            project_id,
+            before,
+            after,
+            (0, 0, after.shape[1], after.shape[0]),
+            operation,
+        )
+        manifest = self.store.manifest(project_id)
+        processing = manifest.get("processing") or {}
+        processing["subject_policy"] = "SELECTED"
+        processing["selected_subject_ids"] = sorted(selected_ids)
+        for subject in processing.get("subjects", []):
+            subject["selected"] = int(subject.get("id", -1)) in selected_ids
+        manifest["processing"] = processing
+        self.store.update_manifest(project_id, manifest)
+        rgb, _, _ = load_canonical_png(self.store.canonical_path(project_id))
         self._refresh_preview(project_id, rgb, after)
         return self._project_payload(project_id)
 
@@ -207,8 +360,11 @@ class Coordinator:
         rgb, _, icc = load_canonical_png(self.store.canonical_path(project_id))
         alpha = self.store.read_alpha(project_id)
         manifest = self.store.manifest(project_id)
+        processing_diagnostics = (manifest.get("processing") or {}).get("diagnostics", {})
         background_rgb = (
-            (manifest.get("processing") or {}).get("diagnostics", {}).get("background_rgb")
+            processing_diagnostics.get("background_model")
+            or processing_diagnostics.get("background_palette_rgb")
+            or processing_diagnostics.get("background_rgb")
         )
         result = export_image(
             output_mode,
@@ -232,6 +388,18 @@ class Coordinator:
 
     def list_models(self, _params: dict[str, Any]) -> dict[str, Any]:
         return {"models": list_model_manifests(self.models_dir)}
+
+    def install_model_pack(self, params: dict[str, Any]) -> dict[str, Any]:
+        manifest = install_model_pack(Path(params["path"]), self.models_dir)
+        return {"model": manifest, "models": list_model_manifests(self.models_dir)}
+
+    def download_model_pack(self, params: dict[str, Any]) -> dict[str, Any]:
+        manifest = download_model_pack(str(params["model_id"]), self.models_dir)
+        return {"model": manifest, "models": list_model_manifests(self.models_dir)}
+
+    def remove_model_pack(self, params: dict[str, Any]) -> dict[str, Any]:
+        removed = remove_model_pack(str(params["model_id"]), self.models_dir)
+        return {"removed": removed, "models": list_model_manifests(self.models_dir)}
 
     def _refresh_preview(
         self, project_id: str, rgb: np.ndarray, alpha: np.ndarray
