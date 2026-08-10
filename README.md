@@ -17,7 +17,7 @@
 - Export `MASTER_SOURCE_FAITHFUL`, `POD_READY` và `ALPHA_ONLY` 16-bit.
 - Release sidecar bằng PyInstaller; máy người dùng không cần Python.
 
-Model AI không bundle sẵn. App chỉ cài `.cutout-modelpack` ONNX có Ed25519 signature, SHA-256, size, commercial/redistribution policy và backend đã qualification; runtime ưu tiên CoreML rồi CPU, không dùng `trust_remote_code`. BiRefNet Lite-matting/ViTMatte-small/SAM 2.1 vẫn ở catalog qualification cho tới khi có artifact được ký và corpus 100 ảnh hợp pháp.
+Model AI không bundle sẵn. App chỉ cài `.cutout-modelpack` ONNX có Ed25519 signature, SHA-256, size, commercial/redistribution policy và backend đã qualification; runtime ưu tiên TensorRT/CUDA/DirectML/CoreML/CPU theo manifest, không dùng `trust_remote_code`. BiRefNet Lite-matting tạo proposal, ViTMatte refine ROI và SAM2 chỉ gate topology; tất cả vẫn cần artifact được ký và corpus 100 ảnh hợp pháp trước khi dùng cho POD.
 
 ## Chạy development
 

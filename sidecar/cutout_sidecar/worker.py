@@ -50,8 +50,25 @@ def process_request(request: dict[str, Any]) -> dict[str, Any]:
     )
     semantic_alpha = None
     semantic_diagnostics: dict[str, Any] = {"status": "not_requested"}
+    topology_diagnostics: dict[str, Any] = {"status": "not_requested"}
     if engine_profile == "V3_AI_LOCAL":
         semantic_alpha, semantic_diagnostics = runtime.semantic_proposal(rgb)
+        if semantic_alpha is not None:
+            topology_alpha, topology_diagnostics = runtime.topology_proposal(rgb, semantic_alpha)
+            if topology_alpha is not None:
+                # SAM2 chỉ quyết định membership/topology; không thay thế alpha fractional.
+                topology_threshold = float(params.get("topology_threshold", 0.5))
+                if not np.isfinite(topology_threshold):
+                    topology_threshold = 0.5
+                topology_mask = topology_alpha >= np.clip(topology_threshold, 0.05, 0.95)
+                gated_semantic = np.where(topology_mask, semantic_alpha, 0.0).astype(np.float32)
+                if np.any(gated_semantic >= 0.5):
+                    semantic_alpha = gated_semantic
+                    topology_diagnostics["applied"] = True
+                else:
+                    # Không để một mask topology rỗng xóa sạch proposal đáng tin cậy.
+                    topology_diagnostics["status"] = "degenerate_membership"
+                    topology_diagnostics["applied"] = False
     alpha, diagnostics = artwork_alpha(
         rgb,
         source_alpha,
@@ -66,12 +83,13 @@ def process_request(request: dict[str, Any]) -> dict[str, Any]:
         alpha, matting_diagnostics = runtime.refine_unknown(rgb, alpha, source_alpha)
     ai_models_used = [
         item["model_id"]
-        for item in (semantic_diagnostics, matting_diagnostics)
+        for item in (semantic_diagnostics, topology_diagnostics, matting_diagnostics)
         if item.get("status") == "ok" and item.get("model_id")
     ]
     diagnostics["inference_srgb_copy"] = bool(inference_color_converted)
     diagnostics["ai_runtime"] = {
         "semantic": semantic_diagnostics,
+        "topology": topology_diagnostics,
         "matting": matting_diagnostics,
     }
     diagnostics["ai_models_used"] = ai_models_used

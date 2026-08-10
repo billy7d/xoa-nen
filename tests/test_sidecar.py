@@ -9,6 +9,7 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 from PIL import Image
@@ -24,7 +25,9 @@ from cutout_sidecar.coordinator import Coordinator  # noqa: E402
 from cutout_sidecar.exports import _decontaminate_edges  # noqa: E402
 from cutout_sidecar.image_core import decode_canonical, load_canonical_png  # noqa: E402
 from cutout_sidecar.legacy_v1 import artwork_alpha as legacy_artwork_alpha  # noqa: E402
+from cutout_sidecar import model_runtime as model_runtime_module  # noqa: E402
 from cutout_sidecar import models as model_registry  # noqa: E402
+from cutout_sidecar.model_runtime import LocalModelRuntime  # noqa: E402
 from cutout_sidecar.models import install_model_pack, list_model_manifests  # noqa: E402
 from cutout_sidecar.processor import (  # noqa: E402
     _delta_e_2000,
@@ -258,6 +261,8 @@ class CoordinatorFlowTests(unittest.TestCase):
         self.source.parent.mkdir()
         self.expected_rgb, self.source_alpha = artwork_fixture(self.source)
         self.coordinator = Coordinator(ProjectStore(root / "projects"))
+        # Cô lập kho model của test để artifact local trên máy phát triển không đổi kết quả regression.
+        self.coordinator.models_dir = root / "models"
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
@@ -516,6 +521,170 @@ class ModelPackTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "corrupt_or_missing_artifact"):
                 install_model_pack(self._signed_pack(root, corrupt_checksum=True), root / "models")
 
+
+class LocalModelRuntimeTests(unittest.TestCase):
+    class FakeInput:
+        def __init__(self, name: str, shape: list[int | None]) -> None:
+            self.name = name
+            self.shape = shape
+
+    class FakeSession:
+        def __init__(self, outputs: list[np.ndarray], inputs: list["LocalModelRuntimeTests.FakeInput"]) -> None:
+            self.outputs = outputs
+            self.inputs = inputs
+            self.last_inputs: dict[str, np.ndarray] = {}
+
+        def get_inputs(self) -> list["LocalModelRuntimeTests.FakeInput"]:
+            return self.inputs
+
+        def get_providers(self) -> list[str]:
+            return ["CPUExecutionProvider"]
+
+        def run(self, _output_names: list[str] | None, inputs: dict[str, np.ndarray]) -> list[np.ndarray]:
+            self.last_inputs = inputs
+            return self.outputs
+
+    class FakeOrt:
+        def __init__(self, session: "LocalModelRuntimeTests.FakeSession") -> None:
+            self.session = session
+
+        def get_available_providers(self) -> list[str]:
+            return ["CPUExecutionProvider"]
+
+        def InferenceSession(self, _path: str, providers: list[str]) -> "LocalModelRuntimeTests.FakeSession":
+            self.session.providers = providers
+            return self.session
+
+    def setUp(self) -> None:
+        model_runtime_module._SESSION_CACHE.clear()
+
+    def tearDown(self) -> None:
+        model_runtime_module._SESSION_CACHE.clear()
+
+    @staticmethod
+    def _manifest(
+        root: Path,
+        *,
+        role: str,
+        adapter: str,
+        input_size: list[int],
+        input_name: str = "image",
+        prompt_input_name: str | None = None,
+    ) -> dict[str, object]:
+        manifest: dict[str, object] = {
+            "model_id": f"test-{adapter}",
+            "revision": "runtime-test-revision",
+            "role": role,
+            "adapter": adapter,
+            "install_path": str(root),
+            "artifacts": [{"filename": "model.onnx", "role": role}],
+            "qualified_backends": ["CPUExecutionProvider"],
+            "input_size": input_size,
+            "input_layout": "NCHW",
+            "normalization": "none",
+            "input_name": input_name,
+            "output_layout": "NCHW",
+            "output_activation": "sigmoid",
+            "output_semantics": "foreground",
+        }
+        if prompt_input_name:
+            manifest["prompt_input_name"] = prompt_input_name
+        return manifest
+
+    def test_birefnet_proposal_decodes_logits_and_resizes_to_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            logits = np.full((1, 1, 4, 4), -10.0, dtype=np.float32)
+            logits[:, :, 1:3, 1:3] = 10.0
+            session = self.FakeSession(
+                [logits],
+                [self.FakeInput("image", [1, 3, 4, 4])],
+            )
+            fake_ort = self.FakeOrt(session)
+            manifest = self._manifest(
+                root,
+                role="base_alpha_proposal",
+                adapter="birefnet-v1",
+                input_size=[4, 4],
+            )
+            rgb = np.full((8, 10, 3), 128, dtype=np.uint8)
+            runtime = LocalModelRuntime(root)
+            with patch.object(runtime, "_ready", return_value=manifest), patch.object(
+                model_runtime_module, "ort", fake_ort
+            ):
+                proposal, diagnostics = runtime.semantic_proposal(rgb)
+
+            self.assertIsNotNone(proposal)
+            assert proposal is not None
+            self.assertEqual(proposal.shape, (8, 10))
+            self.assertGreater(float(proposal[3, 4]), 0.95)
+            self.assertLess(float(proposal[0, 0]), 0.01)
+            self.assertEqual(diagnostics["adapter"], "birefnet-v1")
+            self.assertEqual(session.last_inputs["image"].shape, (1, 3, 4, 4))
+
+    def test_vitmatte_refines_unknown_band_and_preserves_known_pixels(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            session = self.FakeSession(
+                [np.full((1, 1, 4, 4), 2.0, dtype=np.float32)],
+                [self.FakeInput("image", [1, 4, 4, 4])],
+            )
+            fake_ort = self.FakeOrt(session)
+            manifest = self._manifest(
+                root,
+                role="roi_matting",
+                adapter="vitmatte-v1",
+                input_size=[4, 4],
+            )
+            rgb = np.full((32, 32, 3), 120, dtype=np.uint8)
+            alpha = np.zeros((32, 32), dtype=np.float32)
+            alpha[8:24, 8:24] = 1.0
+            alpha[7, 8:24] = 0.5
+            source_alpha = np.ones((32, 32), dtype=np.float32)
+            runtime = LocalModelRuntime(root)
+            with patch.object(runtime, "_ready", return_value=manifest), patch.object(
+                model_runtime_module, "ort", fake_ort
+            ):
+                refined, diagnostics = runtime.refine_unknown(rgb, alpha, source_alpha)
+
+            self.assertEqual(refined.shape, alpha.shape)
+            self.assertAlmostEqual(float(refined[16, 16]), 1.0, places=5)
+            self.assertAlmostEqual(float(refined[0, 0]), 0.0, places=5)
+            self.assertAlmostEqual(float(refined[7, 16]), 0.8808, places=3)
+            self.assertEqual(diagnostics["adapter"], "vitmatte-v1")
+            self.assertEqual(session.last_inputs["image"].shape, (1, 4, 4, 4))
+
+    def test_sam2_topology_uses_mask_prompt_without_writing_fractional_alpha(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            session = self.FakeSession(
+                [np.full((1, 1, 4, 4), 10.0, dtype=np.float32)],
+                [
+                    self.FakeInput("image", [1, 3, 4, 4]),
+                    self.FakeInput("prompt", [1, 1, 4, 4]),
+                ],
+            )
+            fake_ort = self.FakeOrt(session)
+            manifest = self._manifest(
+                root,
+                role="conditional_topology",
+                adapter="sam2-conditional-v1",
+                input_size=[4, 4],
+                prompt_input_name="prompt",
+            )
+            rgb = np.full((8, 8, 3), 100, dtype=np.uint8)
+            semantic = np.full((8, 8), 0.75, dtype=np.float32)
+            runtime = LocalModelRuntime(root)
+            with patch.object(runtime, "_ready", return_value=manifest), patch.object(
+                model_runtime_module, "ort", fake_ort
+            ):
+                topology, diagnostics = runtime.topology_proposal(rgb, semantic)
+
+            self.assertIsNotNone(topology)
+            assert topology is not None
+            self.assertTrue(np.all(topology > 0.99))
+            self.assertEqual(diagnostics["membership_only"], True)
+            self.assertEqual(session.last_inputs["prompt"].shape, (1, 1, 4, 4))
 
 if __name__ == "__main__":
     unittest.main()

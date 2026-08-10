@@ -12,6 +12,8 @@ __pycache__/
 .venv/
 projects/
 exports/
+models/
+.model-staging/
 sidecar/dist/
 sidecar/build/
 *.spec

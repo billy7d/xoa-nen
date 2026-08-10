@@ -23,4 +23,14 @@
 - Ảnh ly 1122×1402 QUALITY: body alpha mean 0,991; 98,20% body >0,95; wall alpha xấp xỉ 0; wall speckle 0%; kết quả có Needs Review cho slab/shadow.
 - Benchmark cup 512² median: FAST khoảng 1,95× V1; QUALITY khoảng 5,77× V1.
 
-Hai ảnh thật thuộc corpus private của người dùng và không được commit/redistribute. Catalog AI chưa có artifact `READY`: qualification 100 ảnh matte 16-bit và parity CoreML/CPU vẫn là điều kiện để ký model-pack phát hành.
+Hai ảnh thật thuộc corpus private của người dùng và không được commit/redistribute. Catalog phát hành chưa có artifact `READY`; hai pack local hiện đã qua kiểm tra chữ ký/SHA-256/backend CPU và smoke test, nhưng qualification 100 ảnh matte 16-bit và parity CoreML/CPU vẫn là điều kiện để phát hành.
+
+## Runtime AI local đã áp dụng
+
+- BiRefNet-compatible ONNX adapter tạo base alpha proposal, hỗ trợ logits/alpha, layout NCHW/NHWC và cache session.
+- ViTMatte-compatible adapter nhận ảnh + trimap nối channel hoặc hai input riêng, chỉ refine unknown band trong ROI.
+- SAM2-compatible topology gate là tùy chọn; chỉ gate membership, không ghi alpha fractional và không được phép xóa sạch proposal khi mask rỗng.
+- Provider được chọn theo manifest và khả năng runtime theo thứ tự TensorRT, CUDA, DirectML, CoreML, CPU.
+- Hai pack local BiRefNet Lite-matting và ViTMatte đã được cài trong `models/` bị bỏ qua bởi Git; SAM2 chưa có ONNX artifact nên chưa tham gia inference.
+
+Chi tiết manifest và trạng thái model weights xem [MODEL_PACK_RUNTIME.md](./MODEL_PACK_RUNTIME.md).

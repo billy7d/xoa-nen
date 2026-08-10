@@ -20,9 +20,11 @@ except ImportError:  # pragma: no cover - release dependency, explicit status in
 
 
 MODEL_PACK_SCHEMA = "1.0.0"
-# Production signing keys are public-only and may be rotated by an app release.
-# Qualification must add a key before a downloadable model can become READY.
-TRUSTED_SIGNING_KEYS: dict[str, str] = {}
+# Khóa ký chỉ chứa public key; private key không nằm trong repo hoặc trong app.
+# Khóa local này dùng để xác minh hai artifact ONNX đã qualification sơ bộ trên máy.
+TRUSTED_SIGNING_KEYS: dict[str, str] = {
+    "local-qualified-2026-08": "+E8YMcnYkQGw/jeE8dmmY7C0CUfQZEH+Y+9Rjye8Rf4=",
+}
 
 PROVISIONAL_MODELS = [
     {
@@ -40,6 +42,13 @@ PROVISIONAL_MODELS = [
         "commercial_pod_allowed": False,
         "redistribution_allowed": False,
         "preprocess_version": "birefnet-lite-candidate-v1",
+        "priority": 100,
+        "input_size": [1024, 1024],
+        "input_layout": "NCHW",
+        "normalization": "imagenet",
+        "output_layout": "NCHW",
+        "output_activation": "auto",
+        "output_semantics": "foreground",
         "qualified_backends": [],
         "runtime_remote_code_allowed": False,
         "download_url": None,
@@ -59,6 +68,16 @@ PROVISIONAL_MODELS = [
         "commercial_pod_allowed": True,
         "redistribution_allowed": False,
         "preprocess_version": "vitmatte-small-candidate-v1",
+        "priority": 100,
+        "input_size": [512, 512],
+        "input_layout": "NCHW",
+        "normalization": "imagenet",
+        "mean": [0.5, 0.5, 0.5],
+        "std": [0.5, 0.5, 0.5],
+        "trimap_mode": "concat",
+        "output_layout": "NCHW",
+        "output_activation": "auto",
+        "output_semantics": "foreground",
         "qualified_backends": [],
         "runtime_remote_code_allowed": False,
         "download_url": None,
@@ -78,6 +97,14 @@ PROVISIONAL_MODELS = [
         "commercial_pod_allowed": True,
         "redistribution_allowed": False,
         "preprocess_version": "sam2.1-candidate-v1",
+        "priority": 50,
+        "input_size": [1024, 1024],
+        "input_layout": "NCHW",
+        "normalization": "imagenet",
+        "prompt_mode": "mask",
+        "output_layout": "NCHW",
+        "output_activation": "auto",
+        "output_semantics": "foreground",
         "qualified_backends": [],
         "runtime_remote_code_allowed": False,
         "download_url": None,
