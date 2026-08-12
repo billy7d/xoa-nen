@@ -34,6 +34,7 @@ from cutout_sidecar.processor import (  # noqa: E402
     _lab_to_srgb,
     _srgb_to_lab,
     artwork_alpha,
+    conservative_object_masks,
     magic_wand_selection,
 )
 from cutout_sidecar.project_store import ProjectStore  # noqa: E402
@@ -196,6 +197,53 @@ class ArtworkEngineTests(unittest.TestCase):
         alpha, _ = artwork_alpha(rgb, semi, tolerance=30, softness=18)
         self.assertLessEqual(float(np.max(alpha - semi)), 1e-7)
         self.assertAlmostEqual(float(np.mean(alpha[30:60, 40:90])), 0.4, places=5)
+
+    def test_ai_conservative_candidate_restores_object_holes_and_preserves_handle_hole(self) -> None:
+        height, width = 96, 128
+        rgb = np.full((height, width, 3), 240, dtype=np.uint8)
+        semantic = np.zeros((height, width), dtype=np.float32)
+        semantic[20:82, 30:88] = 0.99
+        semantic[8:25, 56:62] = 0.99  # Ống hút mảnh.
+        semantic[35:76, 86:116] = 0.99
+        semantic[43:68, 94:108] = 0.0  # Lỗ quai là background thật.
+        source_alpha = np.ones((height, width), dtype=np.float32)
+        source_alpha[26:78, 58:78] = 0.0  # Alpha đầu vào đã xoá nhầm thân.
+        source_alpha[8:25, 56:62] = 0.0
+
+        alpha, diagnostics, guidance = artwork_alpha(
+            rgb,
+            source_alpha,
+            engine_profile="V3_AI_LOCAL",
+            semantic_alpha=semantic,
+            foreground_points=[{"x": 48.0, "y": 48.0}],
+            return_guidance=True,
+        )
+
+        assert guidance is not None
+        self.assertEqual(diagnostics["result_status"], "READY")
+        self.assertGreater(float(alpha[12, 58]), 0.95)
+        self.assertGreater(float(alpha[50, 68]), 0.95)
+        self.assertLess(float(alpha[55, 101]), 0.05)
+        self.assertLess(float(alpha[4, 4]), 0.01)
+        self.assertFalse(np.any(alpha[guidance["sure_foreground"]] < 0.95))
+        self.assertFalse(np.any(guidance["unknown"] & guidance["sure_foreground"]))
+
+    def test_shift_prompt_adds_detached_detail_without_filling_negative_space(self) -> None:
+        semantic = np.zeros((64, 96), dtype=np.float32)
+        semantic[20:56, 24:62] = 0.99
+        semantic[6:17, 70:75] = 0.99  # Chi tiết rời cần Shift-click.
+        semantic[31:47, 48:57] = 0.0
+
+        one_point = conservative_object_masks(semantic, foreground_points=[{"x": 36, "y": 36}])
+        two_points = conservative_object_masks(
+            semantic,
+            foreground_points=[{"x": 36, "y": 36}, {"x": 72, "y": 10}],
+        )
+
+        self.assertFalse(bool(one_point["object_candidate"][10, 72]))
+        self.assertTrue(bool(two_points["object_candidate"][10, 72]))
+        self.assertFalse(bool(two_points["object_candidate"][38, 52]))
+        self.assertTrue(bool(two_points["sure_background"][38, 52]))
 
 
 class MagicWandTests(unittest.TestCase):
@@ -447,6 +495,24 @@ class CoordinatorFlowTests(unittest.TestCase):
         self.assertTrue(any("fallback" in warning.lower() for warning in result["warnings"]))
         self.assertIn("fallback", result["process"]["diagnostics"]["selected_strategy"])
 
+    def test_processing_manifest_persists_conservative_foreground_prompt(self) -> None:
+        imported = self.coordinator.dispatch("import_image", {"path": str(self.source)})
+        result = self.coordinator.dispatch(
+            "process_artwork",
+            {
+                "project_id": imported["project_id"],
+                "foreground_points": [{"x": 50.0, "y": 48.0}],
+                "background_points": [],
+                "protection_mode": "CONSERVATIVE",
+                "shadow_policy": "REMOVE",
+            },
+        )
+        process = result["process"]
+        self.assertEqual(process["foreground_points"], [{"x": 50.0, "y": 48.0}])
+        self.assertEqual(process["protection_mode"], "CONSERVATIVE")
+        self.assertEqual(process["shadow_policy"], "REMOVE")
+        self.assertGreater(float(self.coordinator.store.read_alpha(imported["project_id"])[48, 50]), 0.69)
+
     def test_v2_manifest_migration_preserves_alpha_history_and_does_not_reprocess(self) -> None:
         imported = self.coordinator.dispatch("import_image", {"path": str(self.source)})
         project_id = imported["project_id"]
@@ -570,6 +636,8 @@ class LocalModelRuntimeTests(unittest.TestCase):
         input_size: list[int],
         input_name: str = "image",
         prompt_input_name: str | None = None,
+        point_input_name: str | None = None,
+        point_label_input_name: str | None = None,
     ) -> dict[str, object]:
         manifest: dict[str, object] = {
             "model_id": f"test-{adapter}",
@@ -589,6 +657,10 @@ class LocalModelRuntimeTests(unittest.TestCase):
         }
         if prompt_input_name:
             manifest["prompt_input_name"] = prompt_input_name
+        if point_input_name:
+            manifest["point_input_name"] = point_input_name
+        if point_label_input_name:
+            manifest["point_label_input_name"] = point_label_input_name
         return manifest
 
     def test_birefnet_proposal_decodes_logits_and_resizes_to_source(self) -> None:
@@ -621,6 +693,34 @@ class LocalModelRuntimeTests(unittest.TestCase):
             self.assertLess(float(proposal[0, 0]), 0.01)
             self.assertEqual(diagnostics["adapter"], "birefnet-v1")
             self.assertEqual(session.last_inputs["image"].shape, (1, 3, 4, 4))
+
+    def test_lite_proposal_uses_overlapping_focus_tiles_after_foreground_click(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            session = self.FakeSession(
+                [np.full((1, 1, 4, 4), 10.0, dtype=np.float32)],
+                [self.FakeInput("image", [1, 3, 4, 4])],
+            )
+            fake_ort = self.FakeOrt(session)
+            manifest = self._manifest(
+                root,
+                role="base_alpha_proposal",
+                adapter="birefnet-v1",
+                input_size=[4, 4],
+            )
+            rgb = np.full((8, 10, 3), 128, dtype=np.uint8)
+            runtime = LocalModelRuntime(root)
+            with patch.object(runtime, "_ready", return_value=manifest), patch.object(
+                model_runtime_module, "ort", fake_ort
+            ):
+                proposal, diagnostics = runtime.semantic_proposal(
+                    rgb,
+                    foreground_points=[{"x": 5.0, "y": 4.0}],
+                )
+
+            self.assertIsNotNone(proposal)
+            self.assertEqual(diagnostics["focus_tile_count"], 2)
+            self.assertTrue(np.all(proposal > 0.99))
 
     def test_vitmatte_refines_unknown_band_and_preserves_known_pixels(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -685,6 +785,85 @@ class LocalModelRuntimeTests(unittest.TestCase):
             self.assertTrue(np.all(topology > 0.99))
             self.assertEqual(diagnostics["membership_only"], True)
             self.assertEqual(session.last_inputs["prompt"].shape, (1, 1, 4, 4))
+
+    def test_vitmatte_changes_only_explicit_unknown_band(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            session = self.FakeSession(
+                [np.full((1, 1, 4, 4), 2.0, dtype=np.float32)],
+                [self.FakeInput("image", [1, 4, 4, 4])],
+            )
+            fake_ort = self.FakeOrt(session)
+            manifest = self._manifest(
+                root,
+                role="roi_matting",
+                adapter="vitmatte-v1",
+                input_size=[4, 4],
+            )
+            rgb = np.full((32, 32, 3), 120, dtype=np.uint8)
+            source_alpha = np.ones((32, 32), dtype=np.float32)
+            alpha = np.zeros((32, 32), dtype=np.float32)
+            sure_foreground = np.zeros((32, 32), dtype=bool)
+            sure_foreground[10:22, 10:22] = True
+            unknown = np.zeros((32, 32), dtype=bool)
+            unknown[8:10, 10:22] = True
+            sure_background = ~(sure_foreground | unknown)
+            alpha[sure_foreground] = 1.0
+            runtime = LocalModelRuntime(root)
+            with patch.object(runtime, "_ready", return_value=manifest), patch.object(
+                model_runtime_module, "ort", fake_ort
+            ):
+                refined, diagnostics = runtime.refine_unknown(
+                    rgb,
+                    alpha,
+                    source_alpha,
+                    sure_foreground=sure_foreground,
+                    sure_background=sure_background,
+                    unknown=unknown,
+                )
+
+            self.assertTrue(diagnostics["external_trimap"])
+            self.assertTrue(np.all(refined[sure_foreground] == 1.0))
+            self.assertTrue(np.all(refined[sure_background] == 0.0))
+            self.assertAlmostEqual(float(refined[9, 16]), 0.8808, places=3)
+
+    def test_sam2_topology_forwards_foreground_and_background_points(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            session = self.FakeSession(
+                [np.full((1, 1, 4, 4), 10.0, dtype=np.float32)],
+                [
+                    self.FakeInput("image", [1, 3, 4, 4]),
+                    self.FakeInput("points", [1, None, 2]),
+                    self.FakeInput("labels", [1, None]),
+                ],
+            )
+            fake_ort = self.FakeOrt(session)
+            manifest = self._manifest(
+                root,
+                role="conditional_topology",
+                adapter="sam2-point-prompt-v1",
+                input_size=[4, 4],
+                point_input_name="points",
+                point_label_input_name="labels",
+            )
+            rgb = np.full((8, 8, 3), 100, dtype=np.uint8)
+            semantic = np.full((8, 8), 0.75, dtype=np.float32)
+            runtime = LocalModelRuntime(root)
+            with patch.object(runtime, "_ready", return_value=manifest), patch.object(
+                model_runtime_module, "ort", fake_ort
+            ):
+                topology, diagnostics = runtime.topology_proposal(
+                    rgb,
+                    semantic,
+                    foreground_points=[{"x": 2.0, "y": 4.0}],
+                    background_points=[{"x": 7.0, "y": 0.0}],
+                )
+
+            self.assertIsNotNone(topology)
+            self.assertEqual(diagnostics["prompt_count"], 2)
+            self.assertEqual(session.last_inputs["points"].shape, (1, 2, 2))
+            np.testing.assert_array_equal(session.last_inputs["labels"], [[1.0, 0.0]])
 
 if __name__ == "__main__":
     unittest.main()

@@ -45,6 +45,10 @@ def process_request(request: dict[str, Any]) -> dict[str, Any]:
     canonical_rgb, source_alpha, icc = load_canonical_png(canonical_path)
     rgb, inference_color_converted = inference_srgb_copy(canonical_rgb, icc)
     engine_profile = str(params.get("engine_profile", "V3_BALANCED")).upper()
+    foreground_points = params.get("foreground_points") or []
+    background_points = params.get("background_points") or []
+    if not isinstance(foreground_points, list) or not isinstance(background_points, list):
+        raise ValueError("foreground_points/background_points phải là danh sách")
     runtime = LocalModelRuntime(
         Path(params.get("models_dir") or canonical_path.parents[3] / "models").resolve()
     )
@@ -52,9 +56,14 @@ def process_request(request: dict[str, Any]) -> dict[str, Any]:
     semantic_diagnostics: dict[str, Any] = {"status": "not_requested"}
     topology_diagnostics: dict[str, Any] = {"status": "not_requested"}
     if engine_profile == "V3_AI_LOCAL":
-        semantic_alpha, semantic_diagnostics = runtime.semantic_proposal(rgb)
+        semantic_alpha, semantic_diagnostics = runtime.semantic_proposal(rgb, foreground_points)
         if semantic_alpha is not None:
-            topology_alpha, topology_diagnostics = runtime.topology_proposal(rgb, semantic_alpha)
+            topology_alpha, topology_diagnostics = runtime.topology_proposal(
+                rgb,
+                semantic_alpha,
+                foreground_points,
+                background_points,
+            )
             if topology_alpha is not None:
                 # SAM2 chỉ quyết định membership/topology; không thay thế alpha fractional.
                 topology_threshold = float(params.get("topology_threshold", 0.5))
@@ -62,14 +71,18 @@ def process_request(request: dict[str, Any]) -> dict[str, Any]:
                     topology_threshold = 0.5
                 topology_mask = topology_alpha >= np.clip(topology_threshold, 0.05, 0.95)
                 gated_semantic = np.where(topology_mask, semantic_alpha, 0.0).astype(np.float32)
-                if np.any(gated_semantic >= 0.5):
+                if foreground_points:
+                    # Click bảo vệ có ưu tiên cao hơn topology export chưa đủ parity.
+                    topology_diagnostics["applied"] = False
+                    topology_diagnostics["status"] = "prompt_preserves_semantic"
+                elif np.any(gated_semantic >= 0.5):
                     semantic_alpha = gated_semantic
                     topology_diagnostics["applied"] = True
                 else:
                     # Không để một mask topology rỗng xóa sạch proposal đáng tin cậy.
                     topology_diagnostics["status"] = "degenerate_membership"
                     topology_diagnostics["applied"] = False
-    alpha, diagnostics = artwork_alpha(
+    alpha, diagnostics, matte_guidance = artwork_alpha(
         rgb,
         source_alpha,
         tolerance=float(params.get("tolerance", 30.0)),
@@ -77,10 +90,22 @@ def process_request(request: dict[str, Any]) -> dict[str, Any]:
         quality_preset=str(params.get("quality_preset", "QUALITY")),
         engine_profile=engine_profile,
         semantic_alpha=semantic_alpha,
+        foreground_points=foreground_points,
+        background_points=background_points,
+        protection_mode=str(params.get("protection_mode", "CONSERVATIVE")),
+        shadow_policy=str(params.get("shadow_policy", "REMOVE")),
+        return_guidance=True,
     )
     matting_diagnostics: dict[str, Any] = {"status": "not_requested"}
     if engine_profile == "V3_AI_LOCAL" and semantic_alpha is not None:
-        alpha, matting_diagnostics = runtime.refine_unknown(rgb, alpha, source_alpha)
+        alpha, matting_diagnostics = runtime.refine_unknown(
+            rgb,
+            alpha,
+            matte_guidance.get("source_alpha_ceiling", source_alpha) if matte_guidance else source_alpha,
+            sure_foreground=matte_guidance["sure_foreground"] if matte_guidance else None,
+            sure_background=matte_guidance["sure_background"] if matte_guidance else None,
+            unknown=matte_guidance["unknown"] if matte_guidance else None,
+        )
     ai_models_used = [
         item["model_id"]
         for item in (semantic_diagnostics, topology_diagnostics, matting_diagnostics)

@@ -76,6 +76,32 @@ class Coordinator:
             "processing_engine": "hybrid-cutout-v3",
         }
 
+    @staticmethod
+    def _processing_points(value: Any, width: int, height: int, name: str) -> list[dict[str, float]]:
+        """Kiểm tra và cố định prompt trong hệ toạ độ canonical của project."""
+        if value is None:
+            return []
+        if not isinstance(value, list) or len(value) > 16:
+            raise ValueError(f"{name} phải là danh sách tối đa 16 điểm")
+        points: list[dict[str, float]] = []
+        for item in value:
+            if not isinstance(item, dict):
+                raise ValueError(f"{name} có phần tử không hợp lệ")
+            try:
+                x = float(item["x"])
+                y = float(item["y"])
+            except (KeyError, TypeError, ValueError) as error:
+                raise ValueError(f"{name} có toạ độ không hợp lệ") from error
+            if not np.isfinite(x) or not np.isfinite(y):
+                raise ValueError(f"{name} có toạ độ không hữu hạn")
+            points.append(
+                {
+                    "x": round(min(width - 0.5, max(0.5, x)), 3),
+                    "y": round(min(height - 0.5, max(0.5, y)), 3),
+                }
+            )
+        return points
+
     def import_image(self, params: dict[str, Any]) -> dict[str, Any]:
         canonical = decode_canonical(params["path"])
         manifest = self.store.create(canonical)
@@ -90,8 +116,18 @@ class Coordinator:
         rgb, _, _ = load_canonical_png(self.store.canonical_path(project_id))
         engine_profile = str(params.get("engine_profile", "V3_BALANCED")).upper()
         subject_policy = str(params.get("subject_policy", "ALL_DETECTED")).upper()
+        foreground_points = self._processing_points(
+            params.get("foreground_points"), rgb.shape[1], rgb.shape[0], "foreground_points"
+        )
+        background_points = self._processing_points(
+            params.get("background_points"), rgb.shape[1], rgb.shape[0], "background_points"
+        )
+        protection_mode = str(params.get("protection_mode", "CONSERVATIVE")).upper()
+        shadow_policy = str(params.get("shadow_policy", "REMOVE")).upper()
         if subject_policy not in {"ALL_DETECTED", "SELECTED"}:
             raise ValueError("Subject policy không hợp lệ")
+        if protection_mode != "CONSERVATIVE" or shadow_policy != "REMOVE":
+            raise ValueError("Cấu hình bảo toàn vật thể hoặc bóng không hợp lệ")
         staging_path = self.store.path(project_id) / "alpha" / "staging" / "worker-alpha.npy"
         worker_result = self.worker.request(
             "process_artwork",
@@ -103,6 +139,10 @@ class Coordinator:
                 "quality_preset": str(params.get("quality_preset", "QUALITY")),
                 "engine_profile": engine_profile,
                 "models_dir": str(self.models_dir),
+                "foreground_points": foreground_points,
+                "background_points": background_points,
+                "protection_mode": protection_mode,
+                "shadow_policy": shadow_policy,
             },
         )
         try:
@@ -128,7 +168,14 @@ class Coordinator:
                     "message": "Gói AI chưa sẵn sàng; đã fallback an toàn sang V3 Cân bằng.",
                 }
             )
-        if diagnostics.get("needs_review"):
+        if diagnostics.get("needs_protection"):
+            warnings.append(
+                {
+                    "code": "NEEDS_PROTECTION",
+                    "message": "Ảnh có candidate mâu thuẫn. Chọn Khóa vật thể (P), bấm vào thân và chạy lại để bảo toàn vật thể.",
+                }
+            )
+        elif diagnostics.get("needs_review"):
             warnings.append(
                 {
                     "code": "CUTOUT_NEEDS_REVIEW",
@@ -141,6 +188,11 @@ class Coordinator:
             "engine_profile": engine_profile,
             "quality_preset": diagnostics["quality_preset"],
             "subject_policy": subject_policy,
+            "foreground_points": foreground_points,
+            "background_points": background_points,
+            "protection_mode": protection_mode,
+            "shadow_policy": shadow_policy,
+            "result_status": diagnostics.get("result_status", "READY"),
             "diagnostics": diagnostics,
             "ai_models_used": diagnostics.get("ai_models_used", []),
             "subjects": subjects[:100],

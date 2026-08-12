@@ -5,6 +5,7 @@ import EditorCanvas from "./components/EditorCanvas";
 import type {
   EngineProfile,
   ExportResult,
+  ForegroundPoint,
   HealthPayload,
   ModelManifest,
   OutputMode,
@@ -19,6 +20,7 @@ import type {
 const tools: Array<{ id: ToolMode; label: string; key: string; icon: string }> = [
   { id: "pan", label: "Di chuyển", key: "H", icon: "✥" },
   { id: "subject", label: "Vật thể", key: "O", icon: "▣" },
+  { id: "protect", label: "Khóa vật thể", key: "P", icon: "◉" },
   { id: "keep", label: "Giữ", key: "K", icon: "+" },
   { id: "remove", label: "Xóa", key: "E", icon: "−" },
   { id: "wand-keep", label: "Wand giữ", key: "W", icon: "W+" },
@@ -34,6 +36,7 @@ export default function App() {
   const [health, setHealth] = useState<HealthPayload | null>(null);
   const [models, setModels] = useState<ModelManifest[]>([]);
   const [tool, setTool] = useState<ToolMode>("pan");
+  const [foregroundPoints, setForegroundPoints] = useState<ForegroundPoint[]>([]);
   const [engineProfile, setEngineProfile] = useState<EngineProfile>("V3_BALANCED");
   const [quality, setQuality] = useState<QualityPreset>("QUALITY");
   const [legacyTolerance, setLegacyTolerance] = useState(30);
@@ -97,6 +100,10 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    setForegroundPoints(project?.process?.foreground_points ?? []);
+  }, [project?.project_id, project?.revision]);
+
+  useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       // Khi Wand đang preview, Enter/Esc được ưu tiên để xác nhận hoặc hủy nhanh.
       if (wandPreview && !busy && !event.repeat && !event.isComposing) {
@@ -115,7 +122,7 @@ export default function App() {
       }
       if (event.target instanceof HTMLInputElement || event.target instanceof HTMLSelectElement) return;
       const mapping: Record<string, ToolMode> = {
-        h: "pan", o: "subject", k: "keep", e: "remove", w: "wand-keep", s: "wand-remove",
+        h: "pan", o: "subject", p: "protect", k: "keep", e: "remove", w: "wand-keep", s: "wand-remove",
       };
       if (mapping[event.key.toLowerCase()]) setTool(mapping[event.key.toLowerCase()]);
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "z") {
@@ -140,6 +147,7 @@ export default function App() {
       setWandPreview(null);
       setPreflight(null);
       setTool("pan");
+      setForegroundPoints([]);
     }
   };
 
@@ -153,13 +161,27 @@ export default function App() {
       quality_preset: quality,
       engine_profile: engineProfile,
       subject_policy: "ALL_DETECTED",
+      foreground_points: foregroundPoints,
+      background_points: [],
+      protection_mode: "CONSERVATIVE",
+      shadow_policy: "REMOVE",
     }));
     if (processed) {
       setProject(processed);
       setWandPreview(null);
       setPreflight(null);
-      setTool(processed.process?.review_regions.length ? "subject" : "remove");
+      setTool(processed.process?.result_status === "NEEDS_PROTECTION"
+        ? "protect"
+        : processed.process?.review_regions.length ? "subject" : "remove");
     }
+  };
+
+  const lockForegroundPoint = async (point: ForegroundPoint, append: boolean) => {
+    setForegroundPoints((current) => append ? [...current, point].slice(-16) : [point]);
+    setError(null);
+    setMessage(append
+      ? "Đã thêm điểm khóa. Chạy Xóa nền để áp dụng bảo vệ."
+      : "Đã khóa vật thể. Shift+bấm để thêm quai, ống hút hoặc phần rời.");
   };
 
   const applyBrush = async (points: Array<{ x: number; y: number }>) => {
@@ -324,7 +346,7 @@ export default function App() {
         </aside>
 
         <section className="stage">
-          {canvasProject ? <EditorCanvas project={canvasProject} tool={tool} radius={radius} background={background} disabled={!!busy} onBrush={applyBrush} onWand={previewWand} onSubject={selectSubjectAt} /> : (
+          {canvasProject ? <EditorCanvas project={canvasProject} tool={tool} radius={radius} background={background} disabled={!!busy} foregroundPoints={foregroundPoints} onBrush={applyBrush} onWand={previewWand} onSubject={selectSubjectAt} onProtect={lockForegroundPoint} /> : (
             <button className="empty-state" onClick={importImage}><span className="empty-art">✦</span><strong>Thả artwork vào đây</strong><span>PNG · JPEG · static WebP, tối đa bảo đảm 40 MP</span><em>Chọn ảnh</em></button>
           )}
           {busy && <div className="busy-overlay"><span className="spinner" />{busy}</div>}
@@ -343,6 +365,11 @@ export default function App() {
               <label className="range-row"><span>Tolerance {engineProfile === "LEGACY_V1" ? "V1" : "V3"} <b>{tolerance}</b></span><input type="range" min="1" max="100" value={tolerance} onChange={(event) => engineProfile === "LEGACY_V1" ? setLegacyTolerance(+event.target.value) : setAutoTolerance(+event.target.value)} /></label>
               <label className="range-row"><span>Softness <b>{softness}</b></span><input type="range" min="0" max="60" value={softness} onChange={(event) => engineProfile === "LEGACY_V1" ? setLegacySoftness(+event.target.value) : setAutoSoftness(+event.target.value)} /></label>
               <button className="button primary full" onClick={processArtwork} disabled={!project || !!busy}>Xóa nền</button>
+              <div className="subject-actions">
+                <button type="button" className={tool === "protect" ? "active" : ""} onClick={() => setTool("protect")}>Khóa vật thể (P)</button>
+                <button type="button" onClick={() => setForegroundPoints([])} disabled={!foregroundPoints.length}>Xóa điểm khóa</button>
+              </div>
+              <p className="hint">Bấm Khóa vật thể rồi bấm vào thân. Giữ Shift và bấm thêm ống hút, quai hoặc phần rời; các pixel đã khóa không được phép bị xóa.</p>
               <p className="hint">V3 dùng field nền theo vị trí, graph-cut và refine vùng bất định. Khi thiếu tự tin, app ưu tiên giữ theo V1 và tô vàng Needs Review.</p>
             </section>
 

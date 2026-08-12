@@ -20,9 +20,11 @@ interface Props {
   radius: number;
   background: "checker" | "white" | "black" | "garment";
   disabled?: boolean;
+  foregroundPoints: Point[];
   onBrush: (points: Point[]) => Promise<void>;
   onWand: (point: Point) => Promise<void>;
   onSubject: (point: Point) => Promise<void>;
+  onProtect: (point: Point, append: boolean) => Promise<void>;
 }
 
 interface ViewTransform {
@@ -51,9 +53,11 @@ export default function EditorCanvas({
   radius,
   background,
   disabled,
+  foregroundPoints,
   onBrush,
   onWand,
   onSubject,
+  onProtect,
 }: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -173,6 +177,25 @@ export default function EditorCanvas({
         drawBox(subject.bbox, subject.selected ? "#61e59e" : "#ff7185", false);
       }
     }
+    for (const point of foregroundPoints) {
+      const x = originX + (point.x / project.width) * displayWidth;
+      const y = originY + (point.y / project.height) * displayHeight;
+      ctx.save();
+      ctx.strokeStyle = "#55f19a";
+      ctx.fillStyle = "rgba(15, 73, 45, .78)";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(x, y, 8, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(x - 12, y);
+      ctx.lineTo(x + 12, y);
+      ctx.moveTo(x, y - 12);
+      ctx.lineTo(x, y + 12);
+      ctx.stroke();
+      ctx.restore();
+    }
 
     if (cursor && (tool === "keep" || tool === "remove")) {
       const previewRatio = image.naturalWidth / project.width;
@@ -187,7 +210,7 @@ export default function EditorCanvas({
       ctx.fillStyle = ctx.strokeStyle;
       ctx.fill();
     }
-  }, [background, cursor, pan.x, pan.y, project.height, project.process, project.width, radius, tool, zoom]);
+  }, [background, cursor, foregroundPoints, pan.x, pan.y, project.height, project.process, project.width, radius, tool, zoom]);
   drawRef.current = draw;
 
   useEffect(() => {
@@ -375,6 +398,10 @@ export default function EditorCanvas({
     }
     if (tool === "subject") {
       await onSubject(canonical);
+      return;
+    }
+    if (tool === "protect") {
+      await onProtect(canonical, event.shiftKey);
       return;
     }
     if (tool === "keep" || tool === "remove") {

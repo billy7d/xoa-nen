@@ -7,7 +7,12 @@ export type EngineProfile = "LEGACY_V1" | "V3_BALANCED" | "V3_AI_LOCAL";
 export type WandAlgorithm = "LEGACY_COLOR" | "SMART";
 export type SubjectPolicy = "ALL_DETECTED" | "SELECTED";
 export type QualityPreset = "FAST" | "QUALITY";
-export type ToolMode = "pan" | "subject" | "keep" | "remove" | "wand-keep" | "wand-remove";
+export type ToolMode = "pan" | "subject" | "protect" | "keep" | "remove" | "wand-keep" | "wand-remove";
+
+export interface ForegroundPoint {
+  x: number;
+  y: number;
+}
 
 export interface SubjectCandidate {
   id: number;
@@ -72,6 +77,11 @@ export interface ProjectPayload {
     engine_profile: EngineProfile | "V2_ARCHIVED_RESULT";
     quality_preset: QualityPreset;
     subject_policy: SubjectPolicy;
+    foreground_points?: ForegroundPoint[];
+    background_points?: ForegroundPoint[];
+    protection_mode?: "CONSERVATIVE";
+    shadow_policy?: "REMOVE";
+    result_status?: "READY" | "NEEDS_PROTECTION";
     diagnostics: Record<string, unknown>;
     ai_models_used: string[];
     subjects: SubjectCandidate[];

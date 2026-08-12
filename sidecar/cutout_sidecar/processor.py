@@ -365,6 +365,139 @@ def _resize_mask(mask: np.ndarray, target: tuple[int, int], resample: int) -> np
     return np.asarray(image.resize(target, resample), dtype=np.uint8) > 0
 
 
+def _prompt_points(
+    points: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None,
+    width: int,
+    height: int,
+) -> list[tuple[int, int]]:
+    """Chuẩn hoá điểm prompt về toạ độ pixel của ảnh đang xử lý."""
+    result: list[tuple[int, int]] = []
+    for item in points or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            x = float(item.get("x"))
+            y = float(item.get("y"))
+        except (TypeError, ValueError):
+            continue
+        if not np.isfinite(x) or not np.isfinite(y):
+            continue
+        result.append(
+            (
+                min(width - 1, max(0, int(round(x)))),
+                min(height - 1, max(0, int(round(y)))),
+            )
+        )
+    return result
+
+
+def _prompt_disk(shape: tuple[int, int], points: list[tuple[int, int]], radius: int) -> np.ndarray:
+    """Tạo seed đĩa nhỏ để một click luôn là foreground/background cứng."""
+    height, width = shape
+    result = np.zeros(shape, dtype=bool)
+    for x, y in points:
+        x0, x1 = max(0, x - radius), min(width, x + radius + 1)
+        y0, y1 = max(0, y - radius), min(height, y + radius + 1)
+        grid_y, grid_x = np.ogrid[y0:y1, x0:x1]
+        result[y0:y1, x0:x1] |= (grid_x - x) ** 2 + (grid_y - y) ** 2 <= radius**2
+    return result
+
+
+def _nearest_candidate_pixel(
+    candidate: np.ndarray,
+    point: tuple[int, int],
+    radius: int = 28,
+) -> tuple[int, int] | None:
+    """Tìm pixel candidate gần click để click lệch mép không làm mất vật thể."""
+    x, y = point
+    if candidate[y, x]:
+        return point
+    height, width = candidate.shape
+    x0, x1 = max(0, x - radius), min(width, x + radius + 1)
+    y0, y1 = max(0, y - radius), min(height, y + radius + 1)
+    local_y, local_x = np.nonzero(candidate[y0:y1, x0:x1])
+    if not local_x.size:
+        return None
+    distance = np.square(local_x + x0 - x) + np.square(local_y + y0 - y)
+    index = int(np.argmin(distance))
+    return int(local_x[index] + x0), int(local_y[index] + y0)
+
+
+def _components_from_prompts(candidate: np.ndarray, points: list[tuple[int, int]]) -> tuple[np.ndarray, int]:
+    """Giữ các component có prompt; Shift-click có thể bổ sung component rời."""
+    if not points:
+        return candidate.copy(), 0
+    selected = np.zeros(candidate.shape, dtype=bool)
+    seeds = [
+        seed
+        for point in points
+        if (seed := _nearest_candidate_pixel(candidate, point)) is not None
+    ]
+    if not seeds:
+        return candidate.copy(), 0
+    if cv2 is not None:
+        count, labels = cv2.connectedComponents(candidate.astype(np.uint8), connectivity=8)
+        selected_labels = {int(labels[y, x]) for x, y in seeds if int(labels[y, x]) > 0}
+        if selected_labels:
+            selected = np.isin(labels, list(selected_labels))
+            return selected, len(selected_labels)
+        return candidate.copy(), 0
+    for seed in seeds:
+        selected |= flood_connected(candidate, [seed])
+    return selected, len(seeds)
+
+
+def conservative_object_masks(
+    semantic_alpha: np.ndarray,
+    foreground_points: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None,
+    background_points: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None,
+) -> dict[str, Any]:
+    """Tách candidate bảo toàn vật thể khỏi dải unknown hẹp dành cho matte."""
+    semantic = np.clip(np.asarray(semantic_alpha, dtype=np.float32), 0.0, 1.0)
+    if semantic.ndim != 2:
+        raise ValueError("semantic_alpha phải là ma trận 2D")
+    height, width = semantic.shape
+    foreground = _prompt_points(foreground_points, width, height)
+    background = _prompt_points(background_points, width, height)
+    foreground_seed = _prompt_disk((height, width), foreground, radius=4)
+    background_seed = _prompt_disk((height, width), background, radius=4)
+
+    # Ngưỡng thấp tạo possible foreground có recall cao; không dùng nó để xoá.
+    candidate = semantic >= 0.05
+    silhouette = semantic >= 0.50
+    candidate[background_seed] = False
+    silhouette[background_seed] = False
+    selected_components, selected_component_count = _components_from_prompts(candidate, foreground)
+    if foreground and selected_component_count:
+        candidate &= selected_components
+        silhouette &= selected_components
+    # Điểm khoá vẫn là foreground cứng cả khi model bỏ sót đúng pixel click.
+    candidate |= foreground_seed
+    silhouette |= foreground_seed
+
+    # Core chắc chắn không bao giờ được ViTMatte hoặc graph-cut ghi thành nền.
+    sure_foreground = _morph_mask(silhouette, "erode", radius=2)
+    sure_foreground |= (semantic >= 0.92) & candidate
+    sure_foreground |= foreground_seed
+    sure_foreground &= ~background_seed
+
+    # Dải matte chỉ rộng vài pixel quanh silhouette/possible foreground.
+    candidate_neighbourhood = _morph_mask(candidate, "dilate", radius=4)
+    sure_background = ~candidate_neighbourhood
+    sure_background |= background_seed
+    sure_background &= ~sure_foreground
+    unknown = candidate_neighbourhood & ~sure_foreground & ~sure_background
+    return {
+        "object_candidate": candidate,
+        "sure_foreground": sure_foreground,
+        "sure_background": sure_background,
+        "unknown": unknown,
+        "foreground_seed": foreground_seed,
+        "background_seed": background_seed,
+        "selected_component_count": selected_component_count,
+    }
+
+
 def _box_mean(values: np.ndarray, radius: int) -> np.ndarray:
     if radius <= 0:
         return values.astype(np.float32, copy=True)
@@ -568,6 +701,8 @@ def _graphcut_foreground(
     high: float,
     quality_preset: str,
     semantic_alpha: np.ndarray | None,
+    foreground_seed: np.ndarray | None = None,
+    background_seed: np.ndarray | None = None,
 ) -> tuple[np.ndarray, str]:
     if cv2 is None:
         return legacy_alpha >= 0.5, "opencv_unavailable"
@@ -607,6 +742,14 @@ def _graphcut_foreground(
         mask[(semantic <= 0.03) & spatial_connected] = cv2.GC_BGD
         mask[(semantic >= 0.75) & (mask != cv2.GC_BGD)] = cv2.GC_PR_FGD
         mask[(semantic <= 0.25) & spatial_connected & (mask != cv2.GC_FGD)] = cv2.GC_PR_BGD
+
+    # Prompt được áp dụng sau mọi heuristic để graph-cut không thể phủ định click.
+    if foreground_seed is not None:
+        seed = _resize_mask(foreground_seed, (width, height), Image.Resampling.NEAREST)
+        mask[seed] = cv2.GC_FGD
+    if background_seed is not None:
+        seed = _resize_mask(background_seed, (width, height), Image.Resampling.NEAREST)
+        mask[seed] = cv2.GC_BGD
 
     if not np.any((mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD)):
         return legacy_alpha >= 0.5, "missing_foreground_seed"
@@ -679,16 +822,28 @@ def artwork_alpha(
     quality_preset: str = "QUALITY",
     engine_profile: str = "V3_BALANCED",
     semantic_alpha: np.ndarray | None = None,
-) -> tuple[np.ndarray, dict[str, Any]]:
+    foreground_points: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None,
+    background_points: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None,
+    protection_mode: str = "CONSERVATIVE",
+    shadow_policy: str = "REMOVE",
+    return_guidance: bool = False,
+) -> tuple[np.ndarray, dict[str, Any]] | tuple[np.ndarray, dict[str, Any], dict[str, Any] | None]:
     started = time.perf_counter()
     stage_started = started
     stage_timings: dict[str, float] = {}
     quality_preset = str(quality_preset).upper()
     engine_profile = str(engine_profile).upper()
+    protection_mode = str(protection_mode).upper()
+    shadow_policy = str(shadow_policy).upper()
     if quality_preset not in {"FAST", "QUALITY"}:
         raise ValueError(f"Quality preset không hợp lệ: {quality_preset}")
     if engine_profile not in {"LEGACY_V1", "V3_BALANCED", "V3_AI_LOCAL"}:
         raise ValueError(f"Engine profile không hợp lệ: {engine_profile}")
+
+    if protection_mode != "CONSERVATIVE":
+        raise ValueError(f"Protection mode không hợp lệ: {protection_mode}")
+    if shadow_policy != "REMOVE":
+        raise ValueError(f"Shadow policy không hợp lệ: {shadow_policy}")
 
     legacy_alpha, legacy_diagnostics = legacy_artwork_alpha(
         rgb, source_alpha, tolerance=tolerance, softness=softness
@@ -708,7 +863,27 @@ def artwork_alpha(
                 "latency_ms": round((time.perf_counter() - started) * 1000.0, 3),
             }
         )
+        if return_guidance:
+            return legacy_alpha, diagnostics, None
         return legacy_alpha, diagnostics
+
+    foreground_native = _prompt_points(foreground_points, rgb.shape[1], rgb.shape[0])
+    background_native = _prompt_points(background_points, rgb.shape[1], rgb.shape[0])
+    foreground_seed_native = _prompt_disk(rgb.shape[:2], foreground_native, radius=4)
+    background_seed_native = _prompt_disk(rgb.shape[:2], background_native, radius=4)
+    semantic_native: np.ndarray | None = None
+    guidance: dict[str, Any] | None = None
+    if semantic_alpha is not None:
+        semantic_native = np.clip(
+            _resize_float(semantic_alpha, (rgb.shape[1], rgb.shape[0]), Image.Resampling.BILINEAR),
+            0.0,
+            1.0,
+        )
+        guidance = conservative_object_masks(
+            semantic_native,
+            foreground_points=foreground_points,
+            background_points=background_points,
+        )
 
     proxy_edge = 104 if quality_preset == "FAST" else 192
     proxy_rgb, _, _ = _proxy(rgb, proxy_edge)
@@ -731,7 +906,7 @@ def artwork_alpha(
     is_flat_background = field_diagnostics["order"] == 0 and (
         float(field_diagnostics["border_rgb_p95"]) <= flat_limit
     )
-    if is_flat_background and semantic_alpha is None:
+    if is_flat_background and semantic_native is None:
         diagnostics = {
             "engine": "hybrid-cutout-v3",
             "engine_profile": engine_profile,
@@ -755,6 +930,8 @@ def artwork_alpha(
             "source_alpha_contract": "multiply",
             "latency_ms": round((time.perf_counter() - started) * 1000.0, 3),
         }
+        if return_guidance:
+            return legacy_alpha, diagnostics, None
         return legacy_alpha, diagnostics
 
     graph_foreground, graph_status = _graphcut_foreground(
@@ -765,13 +942,98 @@ def artwork_alpha(
         low,
         high,
         quality_preset,
-        semantic_alpha,
+        semantic_native,
+        foreground_seed_native,
+        background_seed_native,
     )
     stage_timings["graphcut_ms"] = round((time.perf_counter() - stage_started) * 1000.0, 3)
     stage_started = time.perf_counter()
     legacy_background = legacy_proxy < 0.5
     spatial_background = spatial_connected
     graph_background = ~graph_foreground
+
+    if semantic_native is not None and engine_profile == "V3_AI_LOCAL" and guidance is not None:
+        # AI candidate được ưu tiên để graph-cut proxy không có quyền xoá vật thể.
+        object_candidate = guidance["object_candidate"]
+        sure_foreground = guidance["sure_foreground"]
+        sure_background = guidance["sure_background"]
+        # Candidate AI độc lập thay thế alpha cũ trong silhouette để không giữ lỗ đã bị xoá.
+        source_alpha_ceiling = source_alpha.astype(np.float32, copy=True)
+        recovered_source_alpha = object_candidate & (source_alpha_ceiling < 0.98)
+        source_alpha_ceiling[object_candidate] = 1.0
+        guidance["source_alpha_ceiling"] = source_alpha_ceiling
+        semantic_proxy = _resize_float(
+            semantic_native,
+            (proxy_rgb.shape[1], proxy_rgb.shape[0]),
+            Image.Resampling.BILINEAR,
+        )
+        semantic_graph_disagreement = (semantic_proxy >= 0.50) != graph_foreground
+        disagreement_fraction = float(np.mean(semantic_graph_disagreement))
+        alpha = np.where(object_candidate, semantic_native, 0.0).astype(np.float32)
+        alpha[sure_background] = 0.0
+        alpha[sure_foreground] = 1.0
+        # Source alpha vẫn là ràng buộc bất biến của toàn bộ pipeline.
+        alpha = (np.clip(alpha, 0.0, 1.0) * source_alpha_ceiling).astype(np.float32)
+        stage_timings["native_refine_ms"] = round(
+            (time.perf_counter() - stage_started) * 1000.0, 3
+        )
+
+        review_regions: list[dict[str, Any]] = []
+        for region in _component_boxes(semantic_graph_disagreement):
+            x0, y0, x1, y1 = region.pop("bbox_proxy")
+            region["bbox"] = [
+                round(x0 * rgb.shape[1] / proxy_rgb.shape[1]),
+                round(y0 * rgb.shape[0] / proxy_rgb.shape[0]),
+                round(x1 * rgb.shape[1] / proxy_rgb.shape[1]),
+                round(y1 * rgb.shape[0] / proxy_rgb.shape[0]),
+            ]
+            review_regions.append(region)
+        needs_protection = bool(not foreground_native and disagreement_fraction > 0.08)
+        diagnostics = {
+            "engine": "hybrid-cutout-v3",
+            "engine_profile": engine_profile,
+            "selected_strategy": "ai_conservative_object_candidate",
+            "fallback_reason": None if graph_status == "ok" else graph_status,
+            "quality_preset": quality_preset,
+            "tolerance": float(tolerance),
+            "softness": float(softness),
+            "tolerance_delta_e": round(tolerance_de, 4),
+            "background_rgb": legacy_diagnostics["background_rgb"],
+            "background_palette_rgb": [legacy_diagnostics["background_rgb"]],
+            "background_model": field_diagnostics,
+            "graphcut_status": graph_status,
+            "protection_mode": protection_mode,
+            "shadow_policy": shadow_policy,
+            "protection_activated": bool(foreground_native),
+            "result_status": "NEEDS_PROTECTION" if needs_protection else "READY",
+            "candidate_scores": {
+                "legacy_background_fraction": round(float(np.mean(legacy_background)), 6),
+                "spatial_background_fraction": round(float(np.mean(spatial_background)), 6),
+                "graph_background_fraction": round(float(np.mean(graph_background)), 6),
+                "semantic_object_candidate_fraction": round(float(np.mean(object_candidate)), 6),
+                "semantic_graph_disagreement_fraction": round(disagreement_fraction, 6),
+                "edge_unknown_fraction": round(float(np.mean(guidance["unknown"])), 6),
+                "sure_foreground_fraction": round(float(np.mean(sure_foreground)), 6),
+                "source_alpha_recovery_fraction": round(float(np.mean(recovered_source_alpha)), 6),
+                "palette_high_coverage": round(float(np.mean(spatial_distance <= high)), 6),
+            },
+            "needs_review": needs_protection,
+            "needs_protection": needs_protection,
+            "review_regions": review_regions if needs_protection else [],
+            "ai_models_used": [],
+            "native_unknown_refinement": False,
+            "source_alpha_contract": (
+                "conservative_restore_inside_candidate"
+                if np.any(recovered_source_alpha)
+                else "multiply"
+            ),
+            "stage_timings_ms": stage_timings,
+            "latency_ms": round((time.perf_counter() - started) * 1000.0, 3),
+        }
+        if return_guidance:
+            return alpha, diagnostics, guidance
+        return alpha, diagnostics
+
     background_votes = (
         legacy_background.astype(np.uint8)
         + spatial_background.astype(np.uint8)
@@ -817,6 +1079,9 @@ def artwork_alpha(
     sure_foreground_native = _resize_mask(unanimous_foreground, target, Image.Resampling.NEAREST)
     proposal_native[sure_background_native] = 0.0
     proposal_native[sure_foreground_native] = 1.0
+    # Fallback không AI vẫn tôn trọng click foreground/background tuyệt đối.
+    proposal_native[foreground_seed_native] = 1.0
+    proposal_native[background_seed_native] = 0.0
     # Multiplication, not min(), is the immutable source-alpha contract.
     alpha = (np.clip(proposal_native, 0.0, 1.0) * source_alpha).astype(np.float32)
     stage_timings["native_refine_ms"] = round((time.perf_counter() - stage_started) * 1000.0, 3)
@@ -862,6 +1127,8 @@ def artwork_alpha(
         "stage_timings_ms": stage_timings,
         "latency_ms": round((time.perf_counter() - started) * 1000.0, 3),
     }
+    if return_guidance:
+        return alpha, diagnostics, None
     return alpha, diagnostics
 
 

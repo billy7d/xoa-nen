@@ -6,7 +6,8 @@
 - `V3_BALANCED` dùng V1 evidence, robust spatial background field, GrabCut proxy và native unknown-band refinement.
 - `V3_AI_LOCAL` chỉ nhận model-pack ONNX đã xác minh; mọi lỗi model fallback V3 Balanced và ghi `fallback_reason`.
 - Suy luận màu dùng sRGB copy theo ICC. Canonical RGB không bị ghi ngược.
-- Alpha cuối luôn là `SOURCE_ALPHA × CUTOUT_ALPHA`.
+- `LEGACY_V1` và `V3_BALANCED` luôn là `SOURCE_ALPHA × CUTOUT_ALPHA`.
+- Với `V3_AI_LOCAL` + `CONSERVATIVE`, các lỗ alpha cũ chỉ được khôi phục bên trong `object_candidate` có bằng chứng độc lập; vùng ngoài candidate vẫn là background. Điều này tránh giữ lỗi tách nền cũ trong thân vật thể mà không hồi sinh nền.
 - POD decontamination chỉ sửa RGB ở pixel có `0 < alpha < 1`; Master giữ RGB canonical.
 
 ## Các regression v2 đã loại bỏ
@@ -34,3 +35,18 @@ Hai ảnh thật thuộc corpus private của người dùng và không được
 - Hai pack local BiRefNet Lite-matting và ViTMatte đã được cài trong `models/` bị bỏ qua bởi Git; SAM2 chưa có ONNX artifact nên chưa tham gia inference.
 
 Chi tiết manifest và trạng thái model weights xem [MODEL_PACK_RUNTIME.md](./MODEL_PACK_RUNTIME.md).
+
+## Bảo toàn vật thể v4
+
+- `object_candidate` là proposal recall cao, tách biệt với `edge_matte`. Graph-cut chỉ là evidence/seed và không được quyền xóa candidate AI.
+- Khi dùng BiRefNet Lite 512, một foreground click sẽ chạy full-context kèm tối đa ba tile chồng lấn để giữ chi tiết mảnh. Model-pack dynamic/1024+ dùng trực tiếp `input_size` đã được ký trong manifest.
+- Tool **Khóa vật thể** lưu `foreground_points`, `background_points`, `protection_mode=CONSERVATIVE` và `shadow_policy=REMOVE` vào processing manifest. Shift-click bổ sung chi tiết rời.
+- ViTMatte chỉ nhận trimap có `sure_foreground`, `sure_background` và unknown band hẹp. Pixel trong `sure_foreground` bị clamp sau inference.
+- Khi proposal AI và graph-cut bất đồng lớn mà chưa có foreground click, result trả `NEEDS_PROTECTION`; UI yêu cầu khóa vật thể thay vì coi kết quả tự động là đạt.
+- SAM2 chỉ được dùng qua ONNX export đã qualification; raw checkpoint PyTorch không được nạp bởi app.
+
+## QA bảo toàn vật thể 2026-08-11
+
+- Regression synthetic kiểm tra foreground seed, Shift-click detail rời, lỗ quai, phục hồi alpha đã bị xóa, ViTMatte unknown-only, prompt input SAM2 ONNX và persistence manifest.
+- Ảnh ly private được chạy ngoài Git với một foreground click: unknown band 1,8651%, 284.577 pixel `sure_foreground` và 0 pixel bị matte hạ dưới 0,95; lỗ quai có alpha trung bình 0,025689.
+- Các chỉ số recall/F1 tuyệt đối chỉ được công bố sau khi matte ground-truth được người dùng duyệt riêng; trước đó, candidate bất đồng vẫn phải trả `NEEDS_PROTECTION`.
