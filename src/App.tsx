@@ -25,6 +25,7 @@ const tools: Array<{ id: ToolMode; label: string; key: string; icon: string }> =
   { id: "remove", label: "Xóa", key: "E", icon: "−" },
   { id: "wand-keep", label: "Wand giữ", key: "W", icon: "W+" },
   { id: "wand-remove", label: "Wand xóa", key: "S", icon: "W−" },
+  { id: "watermark", label: "Watermark", key: "M", icon: "✦" },
 ];
 
 const basename = (path: string) => path.split(/[\\/]/).pop() || "artwork";
@@ -122,7 +123,7 @@ export default function App() {
       }
       if (event.target instanceof HTMLInputElement || event.target instanceof HTMLSelectElement) return;
       const mapping: Record<string, ToolMode> = {
-        h: "pan", o: "subject", p: "protect", k: "keep", e: "remove", w: "wand-keep", s: "wand-remove",
+        h: "pan", o: "subject", p: "protect", k: "keep", e: "remove", w: "wand-keep", s: "wand-remove", m: "watermark",
       };
       if (mapping[event.key.toLowerCase()]) setTool(mapping[event.key.toLowerCase()]);
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "z") {
@@ -193,6 +194,14 @@ export default function App() {
       hardness: hardness / 100,
       opacity: 1,
       mode: tool === "keep" ? "keep" : "remove",
+    }));
+    if (edited) { setProject(edited); setPreflight(null); }
+  };
+
+  const removeWatermark = async (mode: "AUTO" | "MANUAL", points: Array<{ x: number; y: number }> = []) => {
+    if (!project) return;
+    const edited = await run(mode === "AUTO" ? "Đang tìm và xóa watermark" : "Đang lấp vùng watermark", () => coordinatorCall<ProjectPayload>("remove_watermark", {
+      project_id: project.project_id, mode, points, radius,
     }));
     if (edited) { setProject(edited); setPreflight(null); }
   };
@@ -346,7 +355,7 @@ export default function App() {
         </aside>
 
         <section className="stage">
-          {canvasProject ? <EditorCanvas project={canvasProject} tool={tool} radius={radius} background={background} disabled={!!busy} foregroundPoints={foregroundPoints} onBrush={applyBrush} onWand={previewWand} onSubject={selectSubjectAt} onProtect={lockForegroundPoint} /> : (
+          {canvasProject ? <EditorCanvas project={canvasProject} tool={tool} radius={radius} background={background} disabled={!!busy} foregroundPoints={foregroundPoints} onBrush={applyBrush} onWand={previewWand} onSubject={selectSubjectAt} onProtect={lockForegroundPoint} onWatermark={(points) => removeWatermark("MANUAL", points)} /> : (
             <button className="empty-state" onClick={importImage}><span className="empty-art">✦</span><strong>Thả artwork vào đây</strong><span>PNG · JPEG · static WebP, tối đa bảo đảm 40 MP</span><em>Chọn ảnh</em></button>
           )}
           {busy && <div className="busy-overlay"><span className="spinner" />{busy}</div>}
@@ -358,6 +367,14 @@ export default function App() {
           <nav className="panel-tabs"><button className={panel === "controls" ? "active" : ""} onClick={() => setPanel("controls")}>Xử lý</button><button className={panel === "preflight" ? "active" : ""} onClick={() => setPanel("preflight")}>Preflight</button><button className={panel === "export" ? "active" : ""} onClick={() => setPanel("export")}>Xuất</button></nav>
 
           {panel === "controls" && <div className="panel-content">
+            <section className="control-section">
+              <div className="section-heading"><div><strong>XÓA WATERMARK</strong><small>Inpainting native — giữ nguyên kích thước pixel</small></div><span className="pill">LOCAL</span></div>
+              <button className="button primary full" onClick={() => removeWatermark("AUTO")} disabled={!project || !!busy}>Tự động tìm & xóa</button>
+              <div className="subject-actions"><button type="button" className={tool === "watermark" ? "active" : ""} onClick={() => setTool("watermark")}>Xóa bằng cọ (M)</button></div>
+              <p className="hint">Tự động chỉ chọn các nét chữ/logo nhỏ có tín hiệu watermark để tránh xóa nhầm artwork. Với watermark phức tạp, chọn Xóa bằng cọ, tô phủ toàn bộ watermark rồi thả chuột để lấp nền. Undo/Redo hoạt động cho cả hai chế độ.</p>
+              {project?.retouch?.watermark_removed ? <p className="success-note">Watermark đã được xử lý trong ảnh xuất.</p> : null}
+            </section>
+
             <section className="control-section">
               <div className="section-heading"><div><strong>HYBRID CUTOUT</strong><small>V3 mặc định · V1 luôn khả dụng</small></div><span className="pill">LOCAL</span></div>
               <label>Profile<select value={engineProfile} onChange={(event) => setEngineProfile(event.target.value as EngineProfile)}><option value="V3_BALANCED">V3 Cân bằng — mặc định</option><option value="V3_AI_LOCAL" disabled={!aiReady}>V3 AI Local {aiReady ? "" : "— cần model-pack"}</option><option value="LEGACY_V1">V1 nền phẳng — pixel-exact</option></select></label>
@@ -409,7 +426,7 @@ export default function App() {
           </div>}
 
           {panel === "export" && <div className="panel-content">
-            <section className="control-section export-list"><button onClick={() => exportOutput("MASTER_SOURCE_FAITHFUL")} disabled={!project || !!busy}><span><strong>Master source-faithful</strong><small>RGB canonical delta 0 · alpha mới</small></span><em>PNG 8-bit</em></button><button onClick={() => exportOutput("POD_READY")} disabled={!project || !!busy}><span><strong>POD-ready</strong><small>sRGB · straight alpha · decontaminate cục bộ</small></span><em>PNG 8-bit</em></button><button onClick={() => exportOutput("ALPHA_ONLY")} disabled={!project || !!busy}><span><strong>Alpha only</strong><small>Matte cho QA và trao đổi</small></span><em>PNG 16-bit</em></button></section>
+            <section className="control-section export-list"><button onClick={() => exportOutput("MASTER_SOURCE_FAITHFUL")} disabled={!project || !!busy}><span><strong>{project?.retouch?.watermark_removed ? "Master đã chỉnh watermark" : "Master source-faithful"}</strong><small>{project?.retouch?.watermark_removed ? "RGB đã lấp watermark · giữ nguyên pixel" : "RGB canonical delta 0 · alpha mới"}</small></span><em>PNG 8-bit</em></button><button onClick={() => exportOutput("POD_READY")} disabled={!project || !!busy}><span><strong>POD-ready</strong><small>sRGB · straight alpha · decontaminate cục bộ</small></span><em>PNG 8-bit</em></button><button onClick={() => exportOutput("ALPHA_ONLY")} disabled={!project || !!busy}><span><strong>Alpha only</strong><small>Matte cho QA và trao đổi</small></span><em>PNG 16-bit</em></button></section>
             <section className="control-section"><h3>Tùy chọn POD-ready</h3><label className="check-row"><input type="checkbox" checked={trim} onChange={(event) => setTrim(event.target.checked)} /><span>Trim vùng trong suốt</span></label><label>Padding (px)<input type="number" min="0" max="2000" value={padding} onChange={(event) => setPadding(+event.target.value)} disabled={!trim} /></label><p className="hint">Mặc định giữ nguyên kích thước pixel. App không tự scale hoặc giả 300 DPI.</p></section>
             <section className="contract-note"><strong>Hai output độc lập</strong><p>Master giữ nguyên RGB canonical. POD-ready chỉ decontaminate RGB ở pixel bán trong suốt bằng field nền cục bộ.</p></section>
           </div>}

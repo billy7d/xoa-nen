@@ -442,6 +442,39 @@ class CoordinatorFlowTests(unittest.TestCase):
         self.assertFalse(lines[0]["ok"])
         self.assertTrue(lines[1]["ok"])
 
+    def test_manual_watermark_retouch_keeps_native_size_and_undo_redo(self) -> None:
+        imported = self.coordinator.dispatch("import_image", {"path": str(self.source)})
+        project_id = imported["project_id"]
+        before = self.coordinator.store.read_working_rgb(project_id).copy()
+        result = self.coordinator.dispatch(
+            "remove_watermark",
+            {
+                "project_id": project_id,
+                "mode": "MANUAL",
+                "points": [{"x": 61, "y": 47}, {"x": 64, "y": 47}],
+                "radius": 5,
+            },
+        )
+        after = self.coordinator.store.read_working_rgb(project_id)
+        self.assertEqual(after.shape, before.shape)
+        self.assertTrue(result["retouch"]["watermark_removed"])
+        self.assertFalse(np.array_equal(before, after))
+
+        undone = self.coordinator.dispatch("undo", {"project_id": project_id})
+        np.testing.assert_array_equal(self.coordinator.store.read_working_rgb(project_id), before)
+        self.assertTrue(undone["history"]["can_redo"])
+        self.coordinator.dispatch("redo", {"project_id": project_id})
+        np.testing.assert_array_equal(self.coordinator.store.read_working_rgb(project_id), after)
+
+        destination = Path(self.temporary.name) / "exports" / "retouched.png"
+        exported = self.coordinator.dispatch(
+            "export",
+            {"project_id": project_id, "output_mode": "MASTER_SOURCE_FAITHFUL", "destination": str(destination)},
+        )
+        self.assertEqual((exported["width"], exported["height"]), (128, 96))
+        with Image.open(destination) as image:
+            self.assertEqual(image.size, (128, 96))
+
     def test_wand_preview_commit_and_subject_selection_contracts(self) -> None:
         imported = self.coordinator.dispatch("import_image", {"path": str(self.source)})
         project_id = imported["project_id"]

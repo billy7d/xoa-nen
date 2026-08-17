@@ -7,7 +7,7 @@ export type EngineProfile = "LEGACY_V1" | "V3_BALANCED" | "V3_AI_LOCAL";
 export type WandAlgorithm = "LEGACY_COLOR" | "SMART";
 export type SubjectPolicy = "ALL_DETECTED" | "SELECTED";
 export type QualityPreset = "FAST" | "QUALITY";
-export type ToolMode = "pan" | "subject" | "protect" | "keep" | "remove" | "wand-keep" | "wand-remove";
+export type ToolMode = "pan" | "subject" | "protect" | "keep" | "remove" | "wand-keep" | "wand-remove" | "watermark";
 
 export interface ForegroundPoint {
   x: number;
@@ -89,6 +89,7 @@ export interface ProjectPayload {
     review_regions: ReviewRegion[];
   } | null;
   warnings?: string[];
+  retouch?: { watermark_removed: boolean };
 }
 
 export interface PreflightItem {

@@ -29,6 +29,7 @@ from .preflight import run_preflight
 from .processor import analyze_components, magic_wand_selection, select_components
 from .project_store import ProjectStore, atomic_write_json
 from .worker_supervisor import WorkerSupervisor
+from .watermark import automatic_watermark_mask, brush_mask, inpaint_watermark
 
 
 class Coordinator:
@@ -45,6 +46,7 @@ class Coordinator:
             "import_image": self.import_image,
             "get_project": self.get_project,
             "process_artwork": self.process_artwork,
+            "remove_watermark": self.remove_watermark,
             "apply_brush": self.brush,
             "apply_magic_wand": self.magic_wand,
             "preview_magic_wand": self.preview_magic_wand,
@@ -201,7 +203,28 @@ class Coordinator:
             "warnings": warnings,
         }
         self.store.update_manifest(project_id, manifest)
-        self._refresh_preview(project_id, rgb, alpha)
+        self._refresh_preview(project_id, self.store.read_working_rgb(project_id), alpha)
+        return self._project_payload(project_id)
+
+    def remove_watermark(self, params: dict[str, Any]) -> dict[str, Any]:
+        project_id = params["project_id"]
+        mode = str(params.get("mode", "AUTO")).upper()
+        rgb = self.store.read_working_rgb(project_id)
+        if mode == "AUTO":
+            mask, detection = automatic_watermark_mask(rgb)
+            operation = {"tool": "watermark_auto", "algorithm_version": "opencv-telea-v1", "detection": detection}
+        elif mode == "MANUAL":
+            points = self._processing_points(params.get("points"), rgb.shape[1], rgb.shape[0], "points")
+            mask = brush_mask(rgb.shape[:2], points, float(params.get("radius", 24)))
+            detection = {"pixels": int(np.count_nonzero(mask)), "bounds": []}
+            operation = {"tool": "watermark_manual", "algorithm_version": "opencv-telea-v1", "pixels": detection["pixels"]}
+        else:
+            raise ValueError("Chế độ xoá watermark không hợp lệ")
+        repaired, bounds = inpaint_watermark(rgb, mask)
+        operation["bounds"] = list(bounds)
+        self.store.commit_retouch_edit(project_id, rgb, repaired, bounds, operation)
+        alpha = self.store.read_alpha(project_id)
+        self._refresh_preview(project_id, repaired, alpha)
         return self._project_payload(project_id)
 
     def brush(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -221,7 +244,7 @@ class Coordinator:
             params.get("target_alpha", 1.0),
         )
         self.store.commit_alpha_edit(project_id, before, after, bounds, operation)
-        self._refresh_preview(project_id, rgb, after)
+        self._refresh_preview(project_id, self.store.read_working_rgb(project_id), after)
         return self._project_payload(project_id)
 
     def magic_wand(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -244,7 +267,7 @@ class Coordinator:
             params.get("wand_algorithm", "SMART"),
         )
         self.store.commit_alpha_edit(project_id, before, after, bounds, operation)
-        self._refresh_preview(project_id, canonical_rgb, after)
+        self._refresh_preview(project_id, self.store.read_working_rgb(project_id), after)
         return self._project_payload(project_id)
 
     def preview_magic_wand(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -275,7 +298,7 @@ class Coordinator:
             params.get("mode", "remove"),
         )
         preview_path = self.store.preview_path(project_id, f"wand-preview-{token}")
-        save_preview(canonical_rgb, preview_alpha, preview_path)
+        save_preview(self.store.read_working_rgb(project_id), preview_alpha, preview_path)
         return {
             "selection_id": token,
             "preview_path": str(preview_path.resolve()),
@@ -312,7 +335,7 @@ class Coordinator:
         self.store.commit_alpha_edit(project_id, before, after, bounds, operation)
         selection_path.unlink(missing_ok=True)
         self.store.preview_path(project_id, f"wand-preview-{token}").unlink(missing_ok=True)
-        self._refresh_preview(project_id, canonical_rgb, after)
+        self._refresh_preview(project_id, self.store.read_working_rgb(project_id), after)
         return self._project_payload(project_id)
 
     def cancel_magic_wand(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -352,15 +375,14 @@ class Coordinator:
             subject["selected"] = int(subject.get("id", -1)) in selected_ids
         manifest["processing"] = processing
         self.store.update_manifest(project_id, manifest)
-        rgb, _, _ = load_canonical_png(self.store.canonical_path(project_id))
-        self._refresh_preview(project_id, rgb, after)
+        self._refresh_preview(project_id, self.store.read_working_rgb(project_id), after)
         return self._project_payload(project_id)
 
     def undo(self, params: dict[str, Any]) -> dict[str, Any]:
         project_id = params["project_id"]
         entry = self.store.undo(project_id)
         if entry:
-            rgb, _, _ = load_canonical_png(self.store.canonical_path(project_id))
+            rgb = self.store.read_working_rgb(project_id)
             self._refresh_preview(project_id, rgb, self.store.read_alpha(project_id))
         payload = self._project_payload(project_id)
         payload["history_action"] = "undo" if entry else "none"
@@ -370,7 +392,7 @@ class Coordinator:
         project_id = params["project_id"]
         entry = self.store.redo(project_id)
         if entry:
-            rgb, _, _ = load_canonical_png(self.store.canonical_path(project_id))
+            rgb = self.store.read_working_rgb(project_id)
             self._refresh_preview(project_id, rgb, self.store.read_alpha(project_id))
         payload = self._project_payload(project_id)
         payload["history_action"] = "redo" if entry else "none"
@@ -409,7 +431,8 @@ class Coordinator:
     def export(self, params: dict[str, Any]) -> dict[str, Any]:
         project_id = params["project_id"]
         output_mode = params["output_mode"]
-        rgb, _, icc = load_canonical_png(self.store.canonical_path(project_id))
+        _, _, icc = load_canonical_png(self.store.canonical_path(project_id))
+        rgb = self.store.read_working_rgb(project_id)
         alpha = self.store.read_alpha(project_id)
         manifest = self.store.manifest(project_id)
         processing_diagnostics = (manifest.get("processing") or {}).get("diagnostics", {})
@@ -427,7 +450,7 @@ class Coordinator:
             background_rgb=background_rgb,
             settings=params.get("settings"),
         )
-        if output_mode == "MASTER_SOURCE_FAITHFUL":
+        if output_mode == "MASTER_SOURCE_FAITHFUL" and not self.store.retouch_path(project_id).exists():
             with Image.open(result["path"]) as exported:
                 exported_rgb = np.asarray(exported.convert("RGBA"), dtype=np.uint8)[:, :, :3]
             result["rgb_integrity"] = bool(np.array_equal(rgb, exported_rgb))
@@ -507,4 +530,5 @@ class Coordinator:
             },
             "process": processing,
             "warnings": processing_warnings,
+            "retouch": {"watermark_removed": self.store.retouch_path(project_id).exists()},
         }

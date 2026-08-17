@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from PIL import Image
 
 from .image_core import CanonicalImage, save_canonical_png, save_preview
 
@@ -85,6 +86,7 @@ class ProjectStore:
         (project / "locks").mkdir(parents=True)
         (project / "journal" / "deltas").mkdir(parents=True)
         (project / "previews").mkdir(parents=True)
+        (project / "retouch" / "snapshots").mkdir(parents=True)
         (project / "reports").mkdir(parents=True)
 
         canonical_path = project / "source" / "canonical.png"
@@ -165,6 +167,59 @@ class ProjectStore:
 
     def preview_path(self, project_id: str, name: str = "current") -> Path:
         return self.path(project_id) / "previews" / f"{name}.png"
+
+    def retouch_path(self, project_id: str) -> Path:
+        return self.path(project_id) / "retouch" / "current.png"
+
+    def read_working_rgb(self, project_id: str) -> np.ndarray:
+        path = self.retouch_path(project_id)
+        if not path.exists():
+            path = self.canonical_path(project_id)
+        with Image.open(path) as image:
+            return np.ascontiguousarray(np.asarray(image.convert("RGB"), dtype=np.uint8))
+
+    def write_working_rgb(self, project_id: str, rgb: np.ndarray) -> None:
+        path = self.retouch_path(project_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        Image.fromarray(np.ascontiguousarray(rgb, dtype=np.uint8), "RGB").save(path, format="PNG")
+
+    def commit_retouch_edit(
+        self,
+        project_id: str,
+        before: np.ndarray,
+        after: np.ndarray,
+        bounds: tuple[int, int, int, int],
+        operation: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Journal full-resolution RGB snapshots for a non-destructive retouch edit.
+
+        Alpha edits remain tile-delta based; retouch edits alter RGB and therefore
+        use isolated PNG snapshots so the existing undo/redo timeline stays shared.
+        """
+        manifest = self.manifest(project_id)
+        sequence = int(manifest.get("journal_sequence", 0)) + 1
+        history = list(manifest.get("history", []))
+        cursor = int(manifest.get("history_cursor", len(history)))
+        history = history[:cursor]
+        snapshot_dir = self.path(project_id) / "retouch" / "snapshots"
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
+        before_name = f"{sequence:08d}.before.png"
+        after_name = f"{sequence:08d}.after.png"
+        Image.fromarray(np.ascontiguousarray(before, dtype=np.uint8), "RGB").save(snapshot_dir / before_name)
+        Image.fromarray(np.ascontiguousarray(after, dtype=np.uint8), "RGB").save(snapshot_dir / after_name)
+        self.write_working_rgb(project_id, after)
+        entry = {
+            "sequence": sequence, "operation": operation, "bounds": list(bounds), "tiles": [],
+            "retouch_snapshots": {"before": before_name, "after": after_name}, "created_at": utc_now(),
+        }
+        history.append(entry)
+        manifest["history"] = history
+        manifest["history_cursor"] = len(history)
+        manifest["journal_sequence"] = sequence
+        self.update_manifest(project_id, manifest)
+        with (self.path(project_id) / "journal" / "edits.jsonl").open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        return entry
 
     def _array_directory(self, project_id: str, name: str) -> Path:
         if name not in {"base", "current"}:
@@ -283,6 +338,12 @@ class ProjectStore:
         return entry
 
     def _apply_history_entry(self, project_id: str, entry: dict[str, Any], side: str) -> None:
+        if entry.get("retouch_snapshots"):
+            name = entry["retouch_snapshots"][side]
+            snapshot = self.path(project_id) / "retouch" / "snapshots" / name
+            with Image.open(snapshot) as image:
+                self.write_working_rgb(project_id, np.asarray(image.convert("RGB"), dtype=np.uint8))
+            return
         delta_dir = self.path(project_id) / "journal" / "deltas" / f"{entry['sequence']:08d}"
         current_dir = self._array_directory(project_id, "current")
         for tile in entry["tiles"]:

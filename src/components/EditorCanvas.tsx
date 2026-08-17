@@ -25,6 +25,7 @@ interface Props {
   onWand: (point: Point) => Promise<void>;
   onSubject: (point: Point) => Promise<void>;
   onProtect: (point: Point, append: boolean) => Promise<void>;
+  onWatermark: (points: Point[]) => Promise<void>;
 }
 
 interface ViewTransform {
@@ -58,6 +59,7 @@ export default function EditorCanvas({
   onWand,
   onSubject,
   onProtect,
+  onWatermark,
 }: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -197,12 +199,12 @@ export default function EditorCanvas({
       ctx.restore();
     }
 
-    if (cursor && (tool === "keep" || tool === "remove")) {
+    if (cursor && (tool === "keep" || tool === "remove" || tool === "watermark")) {
       const previewRatio = image.naturalWidth / project.width;
       const brushRadius = radius * previewRatio * scale;
       ctx.beginPath();
       ctx.arc(cursor.x, cursor.y, Math.max(2, brushRadius), 0, Math.PI * 2);
-      ctx.strokeStyle = tool === "keep" ? "#56f09b" : "#ff6078";
+      ctx.strokeStyle = tool === "keep" ? "#56f09b" : tool === "watermark" ? "#65b8ff" : "#ff6078";
       ctx.lineWidth = 1.5;
       ctx.stroke();
       ctx.beginPath();
@@ -404,7 +406,7 @@ export default function EditorCanvas({
       await onProtect(canonical, event.shiftKey);
       return;
     }
-    if (tool === "keep" || tool === "remove") {
+    if (tool === "keep" || tool === "remove" || tool === "watermark") {
       pointerRef.current = { id: event.pointerId, mode: "brush", last: point, points: [canonical] };
     }
   };
@@ -434,7 +436,8 @@ export default function EditorCanvas({
     const active = pointerRef.current;
     pointerRef.current = null;
     if (active?.mode === "brush" && active.points.length > 0) {
-      await onBrush(active.points);
+      if (tool === "watermark") await onWatermark(active.points);
+      else await onBrush(active.points);
     }
     canvasRef.current?.releasePointerCapture(event.pointerId);
   };
