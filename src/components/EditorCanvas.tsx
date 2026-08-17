@@ -18,7 +18,8 @@ interface Props {
   project: ProjectPayload;
   tool: ToolMode;
   radius: number;
-  background: "checker" | "white" | "black" | "garment";
+  background: "checker" | "white" | "black" | "garment" | "custom";
+  backgroundColor?: string;
   disabled?: boolean;
   foregroundPoints: Point[];
   onBrush: (points: Point[]) => Promise<void>;
@@ -53,6 +54,7 @@ export default function EditorCanvas({
   tool,
   radius,
   background,
+  backgroundColor = "#263a58",
   disabled,
   foregroundPoints,
   onBrush,
@@ -137,7 +139,8 @@ export default function EditorCanvas({
         }
       }
     } else {
-      ctx.fillStyle = background === "white" ? "#fff" : background === "black" ? "#080808" : "#263a58";
+      // Màu tùy chọn giúp soi halo POD-clean trên các phông khác nhau.
+      ctx.fillStyle = background === "white" ? "#fff" : background === "black" ? "#080808" : background === "custom" ? backgroundColor : "#263a58";
       ctx.fillRect(0, 0, width, height);
     }
 
@@ -212,7 +215,7 @@ export default function EditorCanvas({
       ctx.fillStyle = ctx.strokeStyle;
       ctx.fill();
     }
-  }, [background, cursor, foregroundPoints, pan.x, pan.y, project.height, project.process, project.width, radius, tool, zoom]);
+  }, [background, backgroundColor, cursor, foregroundPoints, pan.x, pan.y, project.height, project.process, project.width, radius, tool, zoom]);
   drawRef.current = draw;
 
   useEffect(() => {

@@ -69,6 +69,11 @@ button { color: inherit; }
 .background-picker button.active { outline: 2px solid var(--green); outline-offset: 1px; }
 .background-picker .checker { background: conic-gradient(#aaa 25%, #ddd 0 50%, #aaa 0 75%, #ddd 0) 0 0/10px 10px; }
 .background-picker .white { background: white; }.background-picker .black { background: #050505; }.background-picker .garment { background: #263a58; }
+.background-picker .custom { background: conic-gradient(#f45 25%, #4bd 0 50%, #f45 0 75%, #4bd 0) 0 0/10px 10px; }
+.preview-mode { position: absolute; left: 12px; bottom: 12px; display: flex; align-items: center; gap: 5px; padding: 5px; background: rgba(17, 20, 18, .9); border: 1px solid #3a403d; border-radius: 8px; }
+.preview-mode button { border: 1px solid #4b544f; border-radius: 5px; background: #242a27; color: #dbe3de; padding: 4px 7px; cursor: pointer; font-size: 11px; }
+.preview-mode button.active { background: #196c52; border-color: var(--green); }
+.preview-mode input { width: 22px; height: 22px; padding: 0; border: 0; background: transparent; }
 .wand-preview-bar { position: absolute; top: 12px; left: 50%; z-index: 8; display: flex; align-items: center; gap: 7px; padding: 7px 9px; transform: translateX(-50%); color: #e8eee9; background: rgba(23, 28, 25, .94); border: 1px solid #4d5a52; border-radius: 8px; box-shadow: 0 8px 28px rgba(0, 0, 0, .28); font-size: 10px; }
 .wand-preview-bar button { padding: 5px 9px; color: #07130d; background: var(--green); border: 0; border-radius: 5px; cursor: pointer; font-size: 9px; font-weight: 750; }
 .wand-preview-bar button:last-child { color: #dfe7e2; background: #343b37; }

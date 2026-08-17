@@ -4,6 +4,7 @@ import { coordinatorCall, isTauriRuntime } from "./bridge";
 import EditorCanvas from "./components/EditorCanvas";
 import type {
   EngineProfile,
+  EnhancedExportJob,
   ExportResult,
   ForegroundPoint,
   HealthPayload,
@@ -13,6 +14,8 @@ import type {
   ProjectPayload,
   QualityPreset,
   ToolMode,
+  UpscaleMode,
+  UpscaleScale,
   WandAlgorithm,
   WandPreview,
 } from "./types";
@@ -51,7 +54,9 @@ export default function App() {
   const [radius, setRadius] = useState(20);
   const [hardness, setHardness] = useState(82);
   const [contiguous, setContiguous] = useState(true);
-  const [background, setBackground] = useState<"checker" | "white" | "black" | "garment">("checker");
+  const [background, setBackground] = useState<"checker" | "white" | "black" | "garment" | "custom">("checker");
+  const [backgroundColor, setBackgroundColor] = useState("#263a58");
+  const [previewMode, setPreviewMode] = useState<"alpha" | "pod-clean">("pod-clean");
   const [busy, setBusy] = useState<string | null>(null);
   const [message, setMessage] = useState("Sẵn sàng — mọi xử lý diễn ra trên máy này.");
   const [error, setError] = useState<string | null>(null);
@@ -61,6 +66,9 @@ export default function App() {
   const [printUnit, setPrintUnit] = useState<"inch" | "cm">("inch");
   const [trim, setTrim] = useState(false);
   const [padding, setPadding] = useState(0);
+  const [upscaleMode, setUpscaleMode] = useState<UpscaleMode>("NONE");
+  const [upscaleScale, setUpscaleScale] = useState<UpscaleScale>(2);
+  const [enhancedJob, setEnhancedJob] = useState<EnhancedExportJob | null>(null);
   const [panel, setPanel] = useState<"controls" | "preflight" | "export">("controls");
 
   const run = async <T,>(label: string, operation: () => Promise<T>): Promise<T | null> => {
@@ -103,6 +111,20 @@ export default function App() {
   useEffect(() => {
     setForegroundPoints(project?.process?.foreground_points ?? []);
   }, [project?.project_id, project?.revision]);
+
+  useEffect(() => {
+    if (!enhancedJob || ["COMPLETED", "FAILED", "CANCELLED"].includes(enhancedJob.status)) return;
+    const timer = window.setTimeout(() => {
+      void coordinatorCall<EnhancedExportJob>("get_job", { job_id: enhancedJob.job_id })
+        .then((job) => {
+          setEnhancedJob(job);
+          if (job.status === "COMPLETED" && job.result) setMessage(`Đã xuất ${job.result.width}×${job.result.height}: ${job.result.path}`);
+          if (job.status === "FAILED") setError(job.error || "Enhanced export thất bại");
+        })
+        .catch((caught) => setError(friendlyError(caught)));
+    }, 700);
+    return () => window.clearTimeout(timer);
+  }, [enhancedJob]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -303,12 +325,27 @@ export default function App() {
 
   const exportOutput = async (mode: OutputMode) => {
     if (!project) return;
-    const suffix = mode === "MASTER_SOURCE_FAITHFUL" ? "master" : mode === "POD_READY" ? "pod-ready" : "alpha-16bit";
+    const enhanced = mode === "POD_READY" && upscaleMode !== "NONE";
+    const suffix = mode === "MASTER_SOURCE_FAITHFUL" ? "master" : mode === "POD_READY" ? enhanced ? `pod-ready-${upscaleMode.toLowerCase()}-x${upscaleScale}` : "pod-ready" : "alpha-16bit";
     const destination = await save({ defaultPath: `${stem(project.source_path)}-${suffix}.png`, filters: [{ name: "PNG", extensions: ["png"] }] });
     if (!destination) return;
+    const settings = {
+      trim: mode === "POD_READY" && trim,
+      padding: mode === "POD_READY" ? padding : 0,
+      target_ppi: 300,
+      upscale_mode: mode === "POD_READY" ? upscaleMode : "NONE",
+      upscale_scale: enhanced ? upscaleScale : 1,
+    };
+    if (enhanced) {
+      const job = await run(`Đang khởi tạo ${upscaleMode} x${upscaleScale}`, () => coordinatorCall<EnhancedExportJob>("start_enhanced_export", {
+        project_id: project.project_id, output_mode: mode, destination, settings,
+      }));
+      if (job) setEnhancedJob(job);
+      return;
+    }
     const result = await run(`Đang xuất ${mode}`, () => coordinatorCall<ExportResult>("export", {
       project_id: project.project_id, output_mode: mode, destination,
-      settings: { trim: mode === "POD_READY" && trim, padding: mode === "POD_READY" ? padding : 0, target_ppi: 300 },
+      settings,
     }));
     if (result) setMessage(`Đã xuất ${result.width}×${result.height}: ${result.path}`);
   };
@@ -332,9 +369,12 @@ export default function App() {
   const aiReady = installedModels.some((model) => model.role === "base_alpha_proposal");
   const tolerance = engineProfile === "LEGACY_V1" ? legacyTolerance : autoTolerance;
   const softness = engineProfile === "LEGACY_V1" ? legacySoftness : autoSoftness;
+  const upscaleRole = upscaleMode === "SHARP" && upscaleScale === 3 ? "upscale_sharp_x4" : `upscale_${upscaleMode.toLowerCase()}_x${upscaleScale}`;
+  const upscaleReady = upscaleMode === "NONE" || installedModels.some((model) => model.role === upscaleRole);
+  const stablePreviewPath = previewMode === "pod-clean" ? (project?.preview_pod_clean_path || project?.preview_path) : project?.preview_path;
   const canvasProject = project && wandPreview
     ? { ...project, preview_path: wandPreview.preview_path, revision: wandPreview.selection_id }
-    : project;
+    : project ? { ...project, preview_path: stablePreviewPath || project.preview_path } : project;
 
   return (
     <main className="app-shell">
@@ -355,12 +395,17 @@ export default function App() {
         </aside>
 
         <section className="stage">
-          {canvasProject ? <EditorCanvas project={canvasProject} tool={tool} radius={radius} background={background} disabled={!!busy} foregroundPoints={foregroundPoints} onBrush={applyBrush} onWand={previewWand} onSubject={selectSubjectAt} onProtect={lockForegroundPoint} onWatermark={(points) => removeWatermark("MANUAL", points)} /> : (
+          {canvasProject ? <EditorCanvas project={canvasProject} tool={tool} radius={radius} background={background} backgroundColor={backgroundColor} disabled={!!busy} foregroundPoints={foregroundPoints} onBrush={applyBrush} onWand={previewWand} onSubject={selectSubjectAt} onProtect={lockForegroundPoint} onWatermark={(points) => removeWatermark("MANUAL", points)} /> : (
             <button className="empty-state" onClick={importImage}><span className="empty-art">✦</span><strong>Thả artwork vào đây</strong><span>PNG · JPEG · static WebP, tối đa bảo đảm 40 MP</span><em>Chọn ảnh</em></button>
           )}
           {busy && <div className="busy-overlay"><span className="spinner" />{busy}</div>}
+          <div className="preview-mode" aria-label="Chế độ xem trước">
+            <button className={previewMode === "pod-clean" ? "active" : ""} onClick={() => setPreviewMode("pod-clean")}>POD-clean</button>
+            <button className={previewMode === "alpha" ? "active" : ""} onClick={() => setPreviewMode("alpha")}>RGB gốc</button>
+            <input aria-label="Màu nền tùy chọn" type="color" value={backgroundColor} onChange={(event) => { setBackgroundColor(event.target.value); setBackground("custom"); }} />
+          </div>
           {wandPreview && <div className="wand-preview-bar"><span>{wandPreview.selected_pixel_count.toLocaleString()} px được chọn</span><button onClick={commitWand} title="Enter">Áp dụng ↵</button><button onClick={() => cancelWand()} title="Escape">Hủy Esc</button></div>}
-          <div className="background-picker" aria-label="Nền preview">{(["checker", "white", "black", "garment"] as const).map((item) => <button key={item} className={`${item} ${background === item ? "active" : ""}`} onClick={() => setBackground(item)} title={`Nền ${item}`} />)}</div>
+          <div className="background-picker" aria-label="Nền preview">{(["checker", "white", "black", "garment", "custom"] as const).map((item) => <button key={item} className={`${item} ${background === item ? "active" : ""}`} onClick={() => setBackground(item)} title={`Nền ${item}`} />)}</div>
         </section>
 
         <aside className="inspector">
@@ -427,7 +472,8 @@ export default function App() {
 
           {panel === "export" && <div className="panel-content">
             <section className="control-section export-list"><button onClick={() => exportOutput("MASTER_SOURCE_FAITHFUL")} disabled={!project || !!busy}><span><strong>{project?.retouch?.watermark_removed ? "Master đã chỉnh watermark" : "Master source-faithful"}</strong><small>{project?.retouch?.watermark_removed ? "RGB đã lấp watermark · giữ nguyên pixel" : "RGB canonical delta 0 · alpha mới"}</small></span><em>PNG 8-bit</em></button><button onClick={() => exportOutput("POD_READY")} disabled={!project || !!busy}><span><strong>POD-ready</strong><small>sRGB · straight alpha · decontaminate cục bộ</small></span><em>PNG 8-bit</em></button><button onClick={() => exportOutput("ALPHA_ONLY")} disabled={!project || !!busy}><span><strong>Alpha only</strong><small>Matte cho QA và trao đổi</small></span><em>PNG 16-bit</em></button></section>
-            <section className="control-section"><h3>Tùy chọn POD-ready</h3><label className="check-row"><input type="checkbox" checked={trim} onChange={(event) => setTrim(event.target.checked)} /><span>Trim vùng trong suốt</span></label><label>Padding (px)<input type="number" min="0" max="2000" value={padding} onChange={(event) => setPadding(+event.target.value)} disabled={!trim} /></label><p className="hint">Mặc định giữ nguyên kích thước pixel. App không tự scale hoặc giả 300 DPI.</p></section>
+            <section className="control-section"><h3>Tùy chọn POD-ready</h3><label className="check-row"><input type="checkbox" checked={trim} onChange={(event) => setTrim(event.target.checked)} /><span>Trim vùng trong suốt</span></label><label>Padding (px)<input type="number" min="0" max="2000" value={padding} onChange={(event) => setPadding(+event.target.value)} disabled={!trim} /></label><label>AI upscale<select value={upscaleMode} onChange={(event) => setUpscaleMode(event.target.value as UpscaleMode)}><option value="NONE">Không upscale</option><option value="FAITHFUL">FAITHFUL — giữ chữ/logo</option><option value="SHARP">SHARP — nét mạnh</option></select></label><label>Scale<select value={upscaleScale} onChange={(event) => setUpscaleScale(+event.target.value as UpscaleScale)} disabled={upscaleMode === "NONE"}><option value={2}>x2</option><option value={3}>x3</option><option value={4}>x4</option></select></label>{upscaleMode !== "NONE" && <p className="hint">Kích thước xuất: {(project ? project.width * upscaleScale : 0).toLocaleString()}×{(project ? project.height * upscaleScale : 0).toLocaleString()} px. {upscaleReady ? `Sẵn sàng: ${upscaleRole}` : `Cần model-pack ONNX đã qualification: ${upscaleRole}.`}</p>}<p className="hint">Master và Alpha-only luôn giữ native. SHARP có thể thay đổi chi tiết nhỏ; ưu tiên FAITHFUL cho POD.</p></section>
+            {enhancedJob && <section className="control-section"><h3>Enhanced export</h3><p className="hint">{enhancedJob.status}{enhancedJob.error ? ` — ${enhancedJob.error}` : ""}</p>{["QUEUED", "RUNNING", "CANCELLING"].includes(enhancedJob.status) && <button className="button secondary full" onClick={() => coordinatorCall<EnhancedExportJob>("cancel_job", { job_id: enhancedJob.job_id }).then(setEnhancedJob).catch((caught) => setError(friendlyError(caught)))}>Hủy job</button>}</section>}
             <section className="contract-note"><strong>Hai output độc lập</strong><p>Master giữ nguyên RGB canonical. POD-ready chỉ decontaminate RGB ở pixel bán trong suốt bằng field nền cục bộ.</p></section>
           </div>}
         </aside>

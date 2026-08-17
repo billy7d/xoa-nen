@@ -31,6 +31,26 @@ def _resize_float(values: np.ndarray, size: tuple[int, int]) -> np.ndarray:
     )
 
 
+def _letterbox_rgb(rgb: np.ndarray, size: tuple[int, int]) -> tuple[np.ndarray, tuple[int, int, int, int]]:
+    """Giữ tỷ lệ ảnh semantic; trả cả vùng ảnh thật để inverse-map chính xác."""
+    target_width, target_height = size
+    scale = min(target_width / rgb.shape[1], target_height / rgb.shape[0])
+    width = max(1, min(target_width, round(rgb.shape[1] * scale)))
+    height = max(1, min(target_height, round(rgb.shape[0] * scale)))
+    x0 = (target_width - width) // 2
+    y0 = (target_height - height) // 2
+    canvas = np.zeros((target_height, target_width, 3), dtype=np.uint8)
+    canvas[y0 : y0 + height, x0 : x0 + width] = _resize_rgb(rgb, (width, height))
+    return canvas, (x0, y0, width, height)
+
+
+def _hann_weight(height: int, width: int) -> np.ndarray:
+    """Tạo trọng số ghép tile, tránh seam tại vùng chồng lấn ViTMatte."""
+    if height <= 1 or width <= 1:
+        return np.ones((height, width), dtype=np.float32)
+    return np.outer(np.hanning(height), np.hanning(width)).astype(np.float32) + 1e-3
+
+
 def _sigmoid_if_needed(values: np.ndarray) -> np.ndarray:
     values = values.astype(np.float32)
     if float(np.min(values)) < -0.001 or float(np.max(values)) > 1.001:
@@ -247,7 +267,17 @@ class LocalModelRuntime:
         with _SESSION_CACHE_LOCK:
             session = _SESSION_CACHE.get(key)
             if session is None:
-                session = ort.InferenceSession(str(path), providers=list(providers))
+                # DirectML yêu cầu chạy tuần tự và tắt memory-pattern để tránh lỗi/VRAM dư.
+                options = ort.SessionOptions() if hasattr(ort, "SessionOptions") else None
+                if options is not None and "DmlExecutionProvider" in providers:
+                    options.enable_mem_pattern = False
+                    options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+                if options is None:
+                    session = ort.InferenceSession(str(path), providers=list(providers))
+                else:
+                    session = ort.InferenceSession(
+                        str(path), sess_options=options, providers=list(providers)
+                    )
                 _SESSION_CACHE[key] = session
             return session
 
@@ -270,6 +300,16 @@ class LocalModelRuntime:
         return _tensor(values, layout), layout
 
     @staticmethod
+    def _letterboxed_image_input(
+        rgb: np.ndarray, manifest: dict[str, Any], model_input: Any, default_size: tuple[int, int]
+    ) -> tuple[np.ndarray, str, tuple[int, int, int, int]]:
+        size = _input_size(manifest, default_size)
+        layout = _layout_from_input(manifest, model_input, channels=3)
+        letterboxed, mapping = _letterbox_rgb(rgb, size)
+        values = _normalise_image(letterboxed, size, manifest)
+        return _tensor(values, layout), layout, mapping
+
+    @staticmethod
     def _input_name(manifest: dict[str, Any], model_inputs: list[Any], key: str, index: int = 0) -> str:
         configured = manifest.get(key)
         names = [str(item.name) for item in model_inputs]
@@ -281,6 +321,113 @@ class LocalModelRuntime:
         if index >= len(names):
             raise ValueError(f"Model thiếu input thứ {index}: {names}")
         return names[index]
+
+    @staticmethod
+    def _image_output(values: Any, manifest: dict[str, Any]) -> np.ndarray:
+        """Chuẩn hoá tensor SR về RGB thẳng 0..255, không áp sigmoid lên ảnh màu."""
+        array = np.asarray(values, dtype=np.float32)
+        layout = str(manifest.get("output_layout", "AUTO")).upper()
+        if array.ndim == 4:
+            if array.shape[0] != 1:
+                raise ValueError(f"Output SR chỉ hỗ trợ batch=1, nhận {array.shape}")
+            auto_nhwc = layout == "AUTO" and array.shape[-1] in {1, 3, 4}
+            array = array[0] if (layout == "NHWC" or auto_nhwc) else array[0].transpose(1, 2, 0)
+        elif array.ndim == 3 and layout == "NCHW" and array.shape[0] in {1, 3, 4}:
+            array = array.transpose(1, 2, 0)
+        if array.ndim != 3 or array.shape[2] not in {3, 4}:
+            raise ValueError(f"Output SR phải là ảnh RGB/RGBA, nhận {array.shape}")
+        array = array[:, :, :3]
+        output_range = str(manifest.get("output_range", "zero_one")).lower()
+        if output_range in {"minus_one_one", "-1_1"}:
+            array = (array + 1.0) * 0.5
+        elif output_range not in {"zero_one", "0_1"}:
+            raise ValueError(f"output_range SR không hỗ trợ: {output_range}")
+        if str(manifest.get("color_order", "RGB")).upper() == "BGR":
+            array = array[:, :, ::-1]
+        return np.rint(np.clip(array, 0.0, 1.0) * 255.0).astype(np.uint8)
+
+    def upscale_rgb(
+        self,
+        rgb: np.ndarray,
+        mode: str,
+        scale: int,
+        cancel_check: Any | None = None,
+    ) -> tuple[np.ndarray | None, dict[str, Any]]:
+        """Chạy SR ONNX theo tile; thiếu pack luôn báo lỗi, tuyệt đối không giả làm AI."""
+        started = time.perf_counter()
+        normalized_mode = str(mode).upper()
+        if normalized_mode not in {"FAITHFUL", "SHARP"} or scale not in {2, 3, 4}:
+            return None, {"status": "invalid_upscale_request"}
+        native_scale = 4 if normalized_mode == "SHARP" and scale == 3 else scale
+        role = f"upscale_{normalized_mode.lower()}_x{native_scale}"
+        manifest = self._ready(role)
+        if manifest is None:
+            return None, {"status": "model_not_installed", "role": role}
+        providers = self._providers(manifest)
+        if ort is None or not providers:
+            return None, {"status": "runtime_or_qualified_backend_unavailable", "role": role}
+        try:
+            adapter = str(manifest.get("adapter", "")).lower()
+            if adapter not in {"swinir-v1", "realesrgan-v1", "super-resolution-v1", "generic-sr"}:
+                return None, {"status": "unsupported_upscale_adapter", "adapter": adapter}
+            if int(manifest.get("native_scale", native_scale)) != native_scale:
+                return None, {"status": "native_scale_mismatch", "role": role}
+            session = self._session(manifest)
+            model_inputs = list(session.get_inputs())
+            input_name = self._input_name(manifest, model_inputs, "input_name")
+            layout = _layout_from_input(manifest, model_inputs[0], channels=3)
+            backend = session.get_providers()[0]
+            is_gpu = backend != "CPUExecutionProvider"
+            tile_size = int(manifest.get("tile_size_gpu" if is_gpu else "tile_size_cpu", 256 if is_gpu else 128))
+            overlap = int(manifest.get("tile_overlap_gpu" if is_gpu else "tile_overlap_cpu", 32 if is_gpu else 16))
+            tile_size = max(16, min(tile_size, max(rgb.shape[:2])))
+            overlap = max(0, min(overlap, tile_size // 2))
+            output = np.zeros((rgb.shape[0] * native_scale, rgb.shape[1] * native_scale, 3), dtype=np.uint8)
+            tile_count = 0
+            for y in range(0, rgb.shape[0], tile_size):
+                for x in range(0, rgb.shape[1], tile_size):
+                    if cancel_check and cancel_check():
+                        raise InterruptedError("Đã hủy upscale trước khi ghi file")
+                    x1, y1 = min(rgb.shape[1], x + tile_size), min(rgb.shape[0], y + tile_size)
+                    left, top = max(0, x - overlap), max(0, y - overlap)
+                    right, bottom = min(rgb.shape[1], x1 + overlap), min(rgb.shape[0], y1 + overlap)
+                    patch = rgb[top:bottom, left:right].astype(np.float32) / 255.0
+                    if str(manifest.get("color_order", "RGB")).upper() == "BGR":
+                        patch = patch[:, :, ::-1]
+                    tensor = _tensor(patch, layout)
+                    output_name = manifest.get("output_name")
+                    outputs = session.run([str(output_name)] if output_name else None, {input_name: tensor})
+                    output_index = int(manifest.get("output_index", 0))
+                    if output_index < 0 or output_index >= len(outputs):
+                        raise ValueError(f"Output index SR không hợp lệ: {output_index}")
+                    enhanced = self._image_output(outputs[output_index], manifest)
+                    expected = ((bottom - top) * native_scale, (right - left) * native_scale)
+                    if enhanced.shape[:2] != expected:
+                        raise ValueError(
+                            f"Model SR trả {enhanced.shape[:2]}, cần {expected}; manifest/native_scale sai"
+                        )
+                    crop_top, crop_left = (y - top) * native_scale, (x - left) * native_scale
+                    crop_bottom, crop_right = crop_top + (y1 - y) * native_scale, crop_left + (x1 - x) * native_scale
+                    output[y * native_scale : y1 * native_scale, x * native_scale : x1 * native_scale] = enhanced[
+                        crop_top:crop_bottom, crop_left:crop_right
+                    ]
+                    tile_count += 1
+            if native_scale != scale:
+                output = _resize_rgb(output, (rgb.shape[1] * scale, rgb.shape[0] * scale))
+            return output, {
+                "status": "ok", "model_id": manifest.get("model_id"), "revision": manifest.get("revision"),
+                "adapter": adapter, "backend": backend, "native_scale": native_scale,
+                "tile_size": tile_size, "tile_overlap": overlap, "tile_count": tile_count,
+                "latency_ms": round((time.perf_counter() - started) * 1000.0, 3),
+            }
+        except InterruptedError:
+            return None, {"status": "cancelled", "role": role}
+        except Exception as error:
+            return None, {
+                "status": "inference_failed", "role": role,
+                "error": f"{type(error).__name__}: {error}",
+                "latency_ms": round((time.perf_counter() - started) * 1000.0, 3),
+            }
 
     def semantic_proposal(
         self,
@@ -304,8 +451,12 @@ class LocalModelRuntime:
             input_size = _input_size(manifest, (1024, 1024))
 
             def infer(source: np.ndarray) -> np.ndarray:
-                tensor, _ = self._image_input(source, manifest, model_inputs[0], input_size)
+                tensor, _, mapping = self._letterboxed_image_input(
+                    source, manifest, model_inputs[0], input_size
+                )
                 mask = self._run_mask(session, {input_name: tensor}, manifest)
+                x0, y0, width, height = mapping
+                mask = mask[y0 : y0 + height, x0 : x0 + width]
                 return _resize_float(mask, (source.shape[1], source.shape[0]))
 
             proposal = infer(rgb).copy()
@@ -335,6 +486,7 @@ class LocalModelRuntime:
                 "adapter": adapter,
                 "backend": session.get_providers()[0],
                 "input_size": list(input_size),
+                "letterboxed": True,
                 "focus_tile_count": len(focus_tiles),
                 "latency_ms": round((time.perf_counter() - started) * 1000.0, 3),
             }
@@ -501,25 +653,69 @@ class LocalModelRuntime:
             model_inputs = list(session.get_inputs())
             input_name = self._input_name(manifest, model_inputs, "input_name")
             width, height = _input_size(manifest, (512, 512))
-            crop_rgb = rgb[y0:y1, x0:x1]
-            image_tensor, layout = self._image_input(crop_rgb, manifest, model_inputs[0], (width, height))
-            trimap = np.full(alpha[y0:y1, x0:x1].shape, 0.5, dtype=np.float32)
-            trimap[known_background[y0:y1, x0:x1]] = 0.0
-            trimap[known_foreground[y0:y1, x0:x1]] = 1.0
-            trimap = _resize_float(trimap, (width, height))
-            trimap_tensor = _tensor(trimap, layout)
-            inputs: dict[str, np.ndarray]
-            trimap_name = manifest.get("trimap_input_name")
-            if trimap_name:
-                trimap_name = self._input_name(manifest, model_inputs, "trimap_input_name", index=1)
-                inputs = {input_name: image_tensor, trimap_name: trimap_tensor}
-            elif layout == "NHWC":
-                inputs = {input_name: np.concatenate((image_tensor, trimap_tensor), axis=-1)}
-            else:
-                inputs = {input_name: np.concatenate((image_tensor, trimap_tensor), axis=1)}
-            matte = self._run_mask(session, inputs, manifest)
-            matte = _resize_float(matte, (x1 - x0, y1 - y0))
             result = alpha.copy()
+            roi_width, roi_height = x1 - x0, y1 - y0
+            # ViTMatte chỉ thấy tile 512 thay vì toàn bộ quai/cốc bị nén về 512 px.
+            configured_tile = int(manifest.get("tile_size", min(width, height)))
+            tile_width = max(1, min(configured_tile, roi_width))
+            tile_height = max(1, min(configured_tile, roi_height))
+            configured_overlap = int(manifest.get("tile_overlap", 96))
+            overlap_x = min(max(0, configured_overlap), max(0, tile_width - 1))
+            overlap_y = min(max(0, configured_overlap), max(0, tile_height - 1))
+
+            def starts(length: int, tile: int, overlap: int) -> list[int]:
+                if length <= tile:
+                    return [0]
+                stride = max(1, tile - overlap)
+                values = list(range(0, max(1, length - tile + 1), stride))
+                last = length - tile
+                if values[-1] != last:
+                    values.append(last)
+                return values
+
+            matte_sum = np.zeros((roi_height, roi_width), dtype=np.float32)
+            weight_sum = np.zeros((roi_height, roi_width), dtype=np.float32)
+            tile_count = 0
+            for local_y in starts(roi_height, tile_height, overlap_y):
+                for local_x in starts(roi_width, tile_width, overlap_x):
+                    local_x1 = local_x + tile_width
+                    local_y1 = local_y + tile_height
+                    crop_rgb = rgb[y0 + local_y : y0 + local_y1, x0 + local_x : x0 + local_x1]
+                    image_tensor, layout = self._image_input(
+                        crop_rgb, manifest, model_inputs[0], (width, height)
+                    )
+                    trimap = np.full((tile_height, tile_width), 0.5, dtype=np.float32)
+                    local_background = known_background[
+                        y0 + local_y : y0 + local_y1, x0 + local_x : x0 + local_x1
+                    ]
+                    local_foreground = known_foreground[
+                        y0 + local_y : y0 + local_y1, x0 + local_x : x0 + local_x1
+                    ]
+                    trimap[local_background] = 0.0
+                    trimap[local_foreground] = 1.0
+                    trimap_tensor = _tensor(_resize_float(trimap, (width, height)), layout)
+                    trimap_name = manifest.get("trimap_input_name")
+                    if trimap_name:
+                        trimap_name = self._input_name(
+                            manifest, model_inputs, "trimap_input_name", index=1
+                        )
+                        inputs: dict[str, np.ndarray] = {
+                            input_name: image_tensor,
+                            trimap_name: trimap_tensor,
+                        }
+                    elif layout == "NHWC":
+                        inputs = {input_name: np.concatenate((image_tensor, trimap_tensor), axis=-1)}
+                    else:
+                        inputs = {input_name: np.concatenate((image_tensor, trimap_tensor), axis=1)}
+                    matte = _resize_float(
+                        self._run_mask(session, inputs, manifest), (tile_width, tile_height)
+                    )
+                    weights = _hann_weight(tile_height, tile_width)
+                    matte_sum[local_y:local_y1, local_x:local_x1] += matte * weights
+                    weight_sum[local_y:local_y1, local_x:local_x1] += weights
+                    tile_count += 1
+
+            matte = matte_sum / np.maximum(weight_sum, 1e-6)
             local_unknown = unknown[y0:y1, x0:x1]
             view = result[y0:y1, x0:x1]
             view[local_unknown] = matte[local_unknown] * source_alpha[y0:y1, x0:x1][local_unknown]
@@ -532,6 +728,9 @@ class LocalModelRuntime:
                 "adapter": adapter,
                 "backend": session.get_providers()[0],
                 "roi": [x0, y0, x1, y1],
+                "tile_count": tile_count,
+                "tile_size": [tile_width, tile_height],
+                "tile_overlap": [overlap_x, overlap_y],
                 "external_trimap": uses_external_trimap,
                 "unknown_fraction": round(float(np.mean(unknown)), 6),
                 "latency_ms": round((time.perf_counter() - started) * 1000.0, 3),

@@ -2,6 +2,8 @@ export type OutputMode =
   | "MASTER_SOURCE_FAITHFUL"
   | "POD_READY"
   | "ALPHA_ONLY";
+export type UpscaleMode = "NONE" | "FAITHFUL" | "SHARP";
+export type UpscaleScale = 1 | 2 | 3 | 4;
 
 export type EngineProfile = "LEGACY_V1" | "V3_BALANCED" | "V3_AI_LOCAL";
 export type WandAlgorithm = "LEGACY_COLOR" | "SMART";
@@ -66,6 +68,7 @@ export interface ProjectPayload {
   source_path: string;
   project_path: string;
   preview_path: string;
+  preview_pod_clean_path?: string;
   width: number;
   height: number;
   revision: string;
@@ -167,4 +170,18 @@ export interface ExportResult {
   rgb_integrity?: boolean;
   bit_depth: number;
   warnings?: string[];
+  model?: string;
+  backend?: string;
+  native_size?: [number, number];
+  output_size?: [number, number];
+  latency_ms?: number;
+}
+
+export interface EnhancedExportJob {
+  job_id: string;
+  project_id: string;
+  status: "QUEUED" | "RUNNING" | "CANCELLING" | "COMPLETED" | "FAILED" | "CANCELLED";
+  created_at: number;
+  result?: ExportResult | null;
+  error?: string | null;
 }

@@ -6,6 +6,7 @@ import hashlib
 import json
 import sys
 import tempfile
+import threading
 import unittest
 import zipfile
 from pathlib import Path
@@ -22,7 +23,7 @@ if str(SIDECAR) not in sys.path:
     sys.path.insert(0, str(SIDECAR))
 
 from cutout_sidecar.coordinator import Coordinator  # noqa: E402
-from cutout_sidecar.exports import _decontaminate_edges  # noqa: E402
+from cutout_sidecar.exports import _decontaminate_edges, _resize_alpha_with_support, export_image  # noqa: E402
 from cutout_sidecar.image_core import decode_canonical, load_canonical_png  # noqa: E402
 from cutout_sidecar.legacy_v1 import artwork_alpha as legacy_artwork_alpha  # noqa: E402
 from cutout_sidecar import model_runtime as model_runtime_module  # noqa: E402
@@ -300,6 +301,63 @@ class PodEdgeTests(unittest.TestCase):
         median_error = np.mean(np.abs(median_result.astype(np.float32) - foreground))
         self.assertLess(float(palette_error), float(median_error))
 
+    def test_decontamination_never_changes_fully_opaque_or_transparent_pixels(self) -> None:
+        rgb = np.array([[[10, 20, 30], [150, 80, 50], [90, 100, 110]]], dtype=np.uint8)
+        alpha = np.array([[0.0, 0.5, 1.0]], dtype=np.float32)
+        result = _decontaminate_edges(rgb, alpha, [240.0, 240.0, 240.0])
+        np.testing.assert_array_equal(result[:, [0, 2]], rgb[:, [0, 2]])
+
+    def test_alpha_upscale_keeps_exact_output_size_and_transparent_hole(self) -> None:
+        alpha = np.zeros((5, 7), dtype=np.float32)
+        alpha[1:4, 1:6] = 1.0
+        alpha[2, 3] = 0.0  # Lỗ quai/negative space không được sinh alpha.
+        for scale in (2, 3, 4):
+            enhanced = _resize_alpha_with_support(alpha, scale)
+            self.assertEqual(enhanced.shape, (5 * scale, 7 * scale))
+            self.assertTrue(np.all(np.isfinite(enhanced)))
+            self.assertGreaterEqual(float(enhanced.min()), 0.0)
+            self.assertLessEqual(float(enhanced.max()), 1.0)
+            self.assertLess(float(enhanced[2 * scale, 3 * scale]), 0.01)
+
+    def test_upscale_request_refuses_lanczos_when_no_qualified_model_exists(self) -> None:
+        rgb = np.full((8, 8, 3), 120, dtype=np.uint8)
+        alpha = np.ones((8, 8), dtype=np.float32)
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(RuntimeError, "không dùng Lanczos giả AI"):
+                export_image(
+                    "POD_READY", Path(temporary) / "out.png", rgb, alpha, None,
+                    settings={"upscale_mode": "FAITHFUL", "upscale_scale": 2},
+                )
+
+    def test_upscale_export_reports_exact_x2_x3_x4_dimensions_and_alpha(self) -> None:
+        class FakeUpscaleRuntime:
+            """Mock model để test contract export, không đại diện cho model AI phát hành."""
+
+            def upscale_rgb(self, rgb, mode, scale, cancel_check=None):
+                enhanced = np.repeat(np.repeat(rgb, scale, axis=0), scale, axis=1)
+                return enhanced, {
+                    "status": "ok", "model_id": f"mock-{mode.lower()}-x{scale}",
+                    "backend": "CPUExecutionProvider", "latency_ms": 1.0,
+                }
+
+        rgb = np.full((5, 7, 3), 128, dtype=np.uint8)
+        alpha = np.ones((5, 7), dtype=np.float32)
+        alpha[2, 3] = 0.0
+        with tempfile.TemporaryDirectory() as temporary:
+            for scale in (2, 3, 4):
+                destination = Path(temporary) / f"x{scale}.png"
+                result = export_image(
+                    "POD_READY", destination, rgb, alpha, None,
+                    settings={"upscale_mode": "FAITHFUL", "upscale_scale": scale},
+                    runtime=FakeUpscaleRuntime(),
+                )
+                self.assertEqual((result["width"], result["height"]), (7 * scale, 5 * scale))
+                self.assertEqual(result["model"], f"mock-faithful-x{scale}")
+                with Image.open(destination) as image:
+                    output_alpha = np.asarray(image.convert("RGBA"))[:, :, 3]
+                self.assertEqual(output_alpha.shape, (5 * scale, 7 * scale))
+                self.assertEqual(int(output_alpha[2 * scale, 3 * scale]), 0)
+
 
 class CoordinatorFlowTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -528,6 +586,19 @@ class CoordinatorFlowTests(unittest.TestCase):
         self.assertTrue(any("fallback" in warning.lower() for warning in result["warnings"]))
         self.assertIn("fallback", result["process"]["diagnostics"]["selected_strategy"])
 
+    def test_cancel_enhanced_job_marks_job_and_sets_cancellation_event(self) -> None:
+        cancel_event = threading.Event()
+        job_id = "a" * 32
+        # Mô phỏng job đang chạy để kiểm tra cancel không cần model/ảnh thật.
+        self.coordinator._jobs[job_id] = {
+            "job_id": job_id, "project_id": "test", "status": "RUNNING",
+            "created_at": 0.0, "cancel_event": cancel_event, "result": None, "error": None,
+        }
+        result = self.coordinator.dispatch("cancel_job", {"job_id": job_id})
+        self.assertTrue(cancel_event.is_set())
+        self.assertEqual(result["status"], "CANCELLING")
+        self.assertNotIn("cancel_event", result)
+
     def test_processing_manifest_persists_conservative_foreground_prompt(self) -> None:
         imported = self.coordinator.dispatch("import_image", {"path": str(self.source)})
         result = self.coordinator.dispatch(
@@ -722,7 +793,8 @@ class LocalModelRuntimeTests(unittest.TestCase):
             self.assertIsNotNone(proposal)
             assert proposal is not None
             self.assertEqual(proposal.shape, (8, 10))
-            self.assertGreater(float(proposal[3, 4]), 0.95)
+            # Letterbox giữ tỷ lệ nên pixel biên nội suy mềm hơn bản resize méo cũ.
+            self.assertGreater(float(proposal[3, 4]), 0.75)
             self.assertLess(float(proposal[0, 0]), 0.01)
             self.assertEqual(diagnostics["adapter"], "birefnet-v1")
             self.assertEqual(session.last_inputs["image"].shape, (1, 3, 4, 4))

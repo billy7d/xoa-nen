@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import platform
+import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Callable
@@ -12,7 +14,7 @@ from PIL import Image
 
 from . import __version__
 from .edits import apply_brush, apply_magic_wand, apply_wand_coverage
-from .exports import export_image
+from .exports import export_image, pod_clean_rgb
 from .image_core import (
     decode_canonical,
     inference_srgb_copy,
@@ -28,6 +30,7 @@ from .models import (
 from .preflight import run_preflight
 from .processor import analyze_components, magic_wand_selection, select_components
 from .project_store import ProjectStore, atomic_write_json
+from .model_runtime import LocalModelRuntime
 from .worker_supervisor import WorkerSupervisor
 from .watermark import automatic_watermark_mask, brush_mask, inpaint_watermark
 
@@ -39,6 +42,8 @@ class Coordinator:
         self.models_dir = Path(
             os.environ.get("CUTOUT_MODELS_DIR", Path(__file__).resolve().parents[2] / "models")
         ).resolve()
+        self._jobs: dict[str, dict[str, Any]] = {}
+        self._jobs_lock = threading.RLock()
 
     def dispatch(self, method: str, params: dict[str, Any]) -> Any:
         handlers: dict[str, Callable[[dict[str, Any]], Any]] = {
@@ -57,6 +62,9 @@ class Coordinator:
             "redo": self.redo,
             "preflight": self.preflight,
             "export": self.export,
+            "start_enhanced_export": self.start_enhanced_export,
+            "get_job": self.get_job,
+            "cancel_job": self.cancel_job,
             "list_models": self.list_models,
             "install_model_pack": self.install_model_pack,
             "download_model_pack": self.download_model_pack,
@@ -429,6 +437,11 @@ class Coordinator:
         return report
 
     def export(self, params: dict[str, Any]) -> dict[str, Any]:
+        return self._export_impl(params)
+
+    def _export_impl(
+        self, params: dict[str, Any], cancel_check: Callable[[], bool] | None = None
+    ) -> dict[str, Any]:
         project_id = params["project_id"]
         output_mode = params["output_mode"]
         _, _, icc = load_canonical_png(self.store.canonical_path(project_id))
@@ -449,6 +462,8 @@ class Coordinator:
             icc,
             background_rgb=background_rgb,
             settings=params.get("settings"),
+            runtime=LocalModelRuntime(self.models_dir),
+            cancel_check=cancel_check,
         )
         if output_mode == "MASTER_SOURCE_FAITHFUL" and not self.store.retouch_path(project_id).exists():
             with Image.open(result["path"]) as exported:
@@ -460,6 +475,75 @@ class Coordinator:
         manifest["export_settings"][output_mode] = params.get("settings", {})
         self.store.update_manifest(project_id, manifest)
         return result
+
+    def start_enhanced_export(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Chạy SR ở thread riêng để stdio vẫn nhận trạng thái/hủy job."""
+        settings = params.get("settings") or {}
+        if params.get("output_mode") != "POD_READY":
+            raise ValueError("Enhanced export chỉ hỗ trợ POD_READY")
+        if str(settings.get("upscale_mode", "NONE")).upper() not in {"FAITHFUL", "SHARP"}:
+            raise ValueError("Enhanced export cần FAITHFUL hoặc SHARP")
+        if int(settings.get("upscale_scale", 1)) not in {2, 3, 4}:
+            raise ValueError("Enhanced export cần scale x2, x3 hoặc x4")
+        project_id = str(params["project_id"])
+        with self._jobs_lock:
+            if any(
+                job["project_id"] == project_id and job["status"] in {"QUEUED", "RUNNING", "CANCELLING"}
+                for job in self._jobs.values()
+            ):
+                raise RuntimeError("Project này đang có enhanced export chạy")
+            job_id = uuid.uuid4().hex
+            cancel_event = threading.Event()
+            self._jobs[job_id] = {
+                "job_id": job_id,
+                "project_id": project_id,
+                "status": "QUEUED",
+                "created_at": time.time(),
+                "cancel_event": cancel_event,
+                "result": None,
+                "error": None,
+            }
+
+        def execute() -> None:
+            with self._jobs_lock:
+                self._jobs[job_id]["status"] = "RUNNING"
+                self._jobs[job_id]["started_at"] = time.time()
+            try:
+                result = self._export_impl(params, cancel_check=cancel_event.is_set)
+                with self._jobs_lock:
+                    self._jobs[job_id]["result"] = result
+                    self._jobs[job_id]["status"] = "CANCELLED" if cancel_event.is_set() else "COMPLETED"
+            except InterruptedError:
+                with self._jobs_lock:
+                    self._jobs[job_id]["status"] = "CANCELLED"
+            except Exception as error:
+                with self._jobs_lock:
+                    self._jobs[job_id]["status"] = "CANCELLED" if cancel_event.is_set() else "FAILED"
+                    self._jobs[job_id]["error"] = f"{type(error).__name__}: {error}"
+            finally:
+                with self._jobs_lock:
+                    self._jobs[job_id]["finished_at"] = time.time()
+
+        threading.Thread(target=execute, name=f"enhanced-export-{job_id[:8]}", daemon=True).start()
+        return self.get_job({"job_id": job_id})
+
+    def get_job(self, params: dict[str, Any]) -> dict[str, Any]:
+        with self._jobs_lock:
+            job = self._jobs.get(str(params["job_id"]))
+            if job is None:
+                raise FileNotFoundError("Enhanced export job không tồn tại")
+            return {key: value for key, value in job.items() if key != "cancel_event"}
+
+    def cancel_job(self, params: dict[str, Any]) -> dict[str, Any]:
+        with self._jobs_lock:
+            job = self._jobs.get(str(params["job_id"]))
+            if job is None:
+                raise FileNotFoundError("Enhanced export job không tồn tại")
+            if job["status"] in {"COMPLETED", "FAILED", "CANCELLED"}:
+                return self.get_job({"job_id": str(params["job_id"])})
+            job["cancel_event"].set()
+            job["status"] = "CANCELLING"
+            return self.get_job({"job_id": str(params["job_id"])})
 
     def list_models(self, _params: dict[str, Any]) -> dict[str, Any]:
         return {"models": list_model_manifests(self.models_dir)}
@@ -479,13 +563,27 @@ class Coordinator:
     def _refresh_preview(
         self, project_id: str, rgb: np.ndarray, alpha: np.ndarray
     ) -> tuple[int, int]:
-        return save_preview(rgb, alpha, self.store.preview_path(project_id))
+        # Current là alpha/RGB canonical; POD-clean là bản xem trước đúng với RGB xuất POD.
+        save_preview(rgb, alpha, self.store.preview_path(project_id, "current"))
+        manifest = self.store.manifest(project_id)
+        diagnostics = (manifest.get("processing") or {}).get("diagnostics", {})
+        background_rgb = (
+            diagnostics.get("background_model")
+            or diagnostics.get("background_palette_rgb")
+            or diagnostics.get("background_rgb")
+        )
+        _, _, icc_profile = load_canonical_png(self.store.canonical_path(project_id))
+        pod_rgb = pod_clean_rgb(rgb, alpha, icc_profile, background_rgb)
+        return save_preview(pod_rgb, alpha, self.store.preview_path(project_id, "pod-clean"))
 
     def _project_payload(self, project_id: str, preview_name: str = "current") -> dict[str, Any]:
         manifest = self.store.manifest(project_id)
         preview_path = self.store.preview_path(project_id, preview_name)
         if not preview_path.exists():
             preview_path = self.store.preview_path(project_id, "original")
+        pod_clean_path = self.store.preview_path(project_id, "pod-clean")
+        if not pod_clean_path.exists():
+            pod_clean_path = preview_path
         source = manifest["source"]
         current_alpha = self.store.read_alpha(project_id)
         components = analyze_components(current_alpha)
@@ -501,6 +599,7 @@ class Coordinator:
             "source_path": manifest["source_reference"],
             "manifest": manifest,
             "preview_path": str(preview_path.resolve()),
+            "preview_pod_clean_path": str(pod_clean_path.resolve()),
             "revision": str(uuid.uuid4()),
             "width": source["width"],
             "height": source["height"],
