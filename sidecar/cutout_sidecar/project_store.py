@@ -191,10 +191,10 @@ class ProjectStore:
         bounds: tuple[int, int, int, int],
         operation: dict[str, Any],
     ) -> dict[str, Any]:
-        """Journal full-resolution RGB snapshots for a non-destructive retouch edit.
+        """Ghi ảnh chụp RGB native cho một lần retouch không phá hủy.
 
-        Alpha edits remain tile-delta based; retouch edits alter RGB and therefore
-        use isolated PNG snapshots so the existing undo/redo timeline stays shared.
+        Chỉnh alpha vẫn dùng tile delta; retouch thay RGB nên dùng PNG tách riêng
+        để tiếp tục dùng chung dòng thời gian undo/redo hiện có.
         """
         manifest = self.manifest(project_id)
         sequence = int(manifest.get("journal_sequence", 0)) + 1
