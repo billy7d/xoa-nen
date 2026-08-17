@@ -13,7 +13,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageCms
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
@@ -23,7 +23,7 @@ if str(SIDECAR) not in sys.path:
     sys.path.insert(0, str(SIDECAR))
 
 from cutout_sidecar.coordinator import Coordinator  # noqa: E402
-from cutout_sidecar.exports import _decontaminate_edges, _resize_alpha_with_support, export_image  # noqa: E402
+from cutout_sidecar.exports import _decontaminate_edges, _resize_alpha_with_support, export_image, pod_clean_rgb  # noqa: E402
 from cutout_sidecar.image_core import decode_canonical, load_canonical_png  # noqa: E402
 from cutout_sidecar.legacy_v1 import artwork_alpha as legacy_artwork_alpha  # noqa: E402
 from cutout_sidecar import model_runtime as model_runtime_module  # noqa: E402
@@ -288,6 +288,16 @@ class MagicWandTests(unittest.TestCase):
 
 
 class PodEdgeTests(unittest.TestCase):
+    def test_pod_preview_with_icc_profile_returns_rgb(self) -> None:
+        rgb = np.full((4, 5, 3), 128, dtype=np.uint8)
+        alpha = np.ones((4, 5), dtype=np.float32)
+        icc = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
+
+        preview_rgb = pod_clean_rgb(rgb, alpha, icc, None)
+
+        self.assertEqual(preview_rgb.shape, rgb.shape)
+        self.assertEqual(preview_rgb.dtype, np.uint8)
+
     def test_multimode_palette_decontaminates_each_edge_against_nearest_background(self) -> None:
         foreground = np.array([190.0, 50.0, 25.0], dtype=np.float32)
         backgrounds = np.array([[240.0, 240.0, 240.0], [24.0, 24.0, 24.0]], dtype=np.float32)

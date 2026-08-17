@@ -51,6 +51,18 @@ def _convert_to_srgb(rgb: np.ndarray, icc_profile: bytes | None) -> np.ndarray:
     image = Image.fromarray(rgb, "RGB")
     if not icc_profile:
         return rgb.copy()
+    try:
+        source = ImageCms.ImageCmsProfile(BytesIO(icc_profile))
+        converted = ImageCms.profileToProfile(
+            image,
+            source,
+            ImageCms.createProfile("sRGB"),
+            outputMode="RGB",
+        )
+        return np.asarray(converted, dtype=np.uint8).copy()
+    except (ImageCms.PyCMSError, OSError, ValueError):
+        # ICC lỗi không được làm hỏng preview hoặc thao tác xóa watermark.
+        return rgb.copy()
 
 
 def _srgb_to_linear(values: np.ndarray) -> np.ndarray:
@@ -85,17 +97,6 @@ def _background_linear(
     palette = np.asarray(background_rgb, dtype=np.float32).reshape(-1, 3)
     distances = np.sum(np.square(observed[:, None, :] - palette[None, :, :]), axis=2)
     return _srgb_to_linear(palette[np.argmin(distances, axis=1)])
-    try:
-        source = ImageCms.ImageCmsProfile(BytesIO(icc_profile))
-        converted = ImageCms.profileToProfile(
-            image,
-            source,
-            ImageCms.createProfile("sRGB"),
-            outputMode="RGB",
-        )
-        return np.asarray(converted, dtype=np.uint8).copy()
-    except (ImageCms.PyCMSError, OSError, ValueError):
-        return rgb.copy()
 
 
 def _decontaminate_edges(
