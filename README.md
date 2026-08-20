@@ -11,13 +11,14 @@
 - Ba profile độc lập: `V3 Cân bằng` mặc định, `V3 AI Local` tùy chọn và `V1 nền phẳng` đúng output V1.
 - V3 classical: robust constant/affine/quadratic background field, consensus trimap, OpenCV GrabCut và refine native-resolution chỉ trong vùng bất định; không còn hard edge barrier/dilate/fill-hole/blend toàn ảnh của v2.
 - Brush Keep/Remove native-coordinate; Wand có `Legacy Color` đúng V1 và `Smart` dùng Lab seed patch + link-cost geodesic, luôn preview trước commit.
+- Xóa watermark V2 tạo mask staging có thể thêm/xóa bằng cọ, preview trước khi commit và giữ pixel ngoài mask byte-exact. Router local chọn TELEA cho vết đơn giản, ShiftMap/texture khi có `opencv-contrib`, hoặc model-pack LaMa-compatible đã qualification.
 - Subject candidates, chọn nhiều vật thể, vùng Needs Review màu vàng và fallback bảo thủ khi proposal bất đồng.
 - Alpha authoritative float32, tile 512 px nén zlib trong `.cutoutproj`; manifest/journal được ghi nguyên tử.
 - Preview checker/white/black/garment, component inspector và effective-PPI preflight.
 - Export `MASTER_SOURCE_FAITHFUL`, `POD_READY` và `ALPHA_ONLY` 16-bit.
 - Release sidecar bằng PyInstaller; máy người dùng không cần Python.
 
-Model AI không bundle sẵn. App chỉ cài `.cutout-modelpack` ONNX có Ed25519 signature, SHA-256, size, commercial/redistribution policy và backend đã qualification; runtime ưu tiên TensorRT/CUDA/DirectML/CoreML/CPU theo manifest, không dùng `trust_remote_code`. BiRefNet Lite-matting tạo proposal, ViTMatte refine ROI và SAM2 chỉ gate topology; tất cả vẫn cần artifact được ký và corpus 100 ảnh hợp pháp trước khi dùng cho POD.
+Model AI không bundle sẵn. App chỉ cài `.cutout-modelpack` ONNX có Ed25519 signature, SHA-256, size, commercial/redistribution policy và backend đã qualification; runtime ưu tiên TensorRT/CUDA/DirectML/CoreML/CPU theo manifest, không dùng `trust_remote_code`. BiRefNet Lite-matting tạo proposal, ViTMatte refine ROI, SAM2 chỉ gate topology và `lama-inpaint-v1` tái tạo ROI watermark; tất cả vẫn cần artifact được ký và corpus 100 ảnh hợp pháp trước khi dùng cho POD.
 
 ## Chạy development
 

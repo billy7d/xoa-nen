@@ -7,6 +7,7 @@ import json
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import zipfile
 from pathlib import Path
@@ -543,6 +544,52 @@ class CoordinatorFlowTests(unittest.TestCase):
         with Image.open(destination) as image:
             self.assertEqual(image.size, (128, 96))
 
+    def test_watermark_session_preview_is_non_destructive_until_commit(self) -> None:
+        imported = self.coordinator.dispatch("import_image", {"path": str(self.source)})
+        project_id = imported["project_id"]
+        before = self.coordinator.store.read_working_rgb(project_id).copy()
+        session = self.coordinator.dispatch(
+            "start_watermark_session", {"project_id": project_id, "mode": "MANUAL"}
+        )
+        self.assertEqual(session["mask_pixels"], 0)
+        updated = self.coordinator.dispatch(
+            "update_watermark_mask",
+            {
+                "project_id": project_id,
+                "session_id": session["session_id"],
+                "mode": "ADD",
+                "points": [{"x": 61, "y": 47}, {"x": 64, "y": 47}],
+                "radius": 5,
+            },
+        )
+        self.assertGreater(updated["mask_pixels"], 0)
+        self.assertTrue(Path(updated["mask_preview_path"]).is_file())
+        np.testing.assert_array_equal(self.coordinator.store.read_working_rgb(project_id), before)
+
+        job = self.coordinator.dispatch(
+            "start_watermark_preview",
+            {"project_id": project_id, "session_id": session["session_id"], "engine": "FAST"},
+        )
+        for _ in range(40):
+            if job["status"] in {"COMPLETED", "FAILED", "CANCELLED"}:
+                break
+            time.sleep(0.025)
+            job = self.coordinator.dispatch("get_job", {"job_id": job["job_id"]})
+        self.assertEqual(job["status"], "COMPLETED", job.get("error"))
+        self.assertTrue(Path(job["result"]["preview_path"]).is_file())
+        np.testing.assert_array_equal(self.coordinator.store.read_working_rgb(project_id), before)
+
+        committed = self.coordinator.dispatch(
+            "commit_watermark_session", {"project_id": project_id, "session_id": session["session_id"]}
+        )
+        after = self.coordinator.store.read_working_rgb(project_id)
+        self.assertTrue(committed["retouch"]["watermark_removed"])
+        self.assertFalse(np.array_equal(before, after))
+        bounds = updated["bounds"]
+        outside = np.ones(before.shape[:2], dtype=bool)
+        outside[bounds[1] : bounds[3], bounds[0] : bounds[2]] = False
+        np.testing.assert_array_equal(before[outside], after[outside])
+
     def test_wand_preview_commit_and_subject_selection_contracts(self) -> None:
         imported = self.coordinator.dispatch("import_image", {"path": str(self.source)})
         project_id = imported["project_id"]
@@ -836,6 +883,34 @@ class LocalModelRuntimeTests(unittest.TestCase):
             self.assertIsNotNone(proposal)
             self.assertEqual(diagnostics["focus_tile_count"], 2)
             self.assertTrue(np.all(proposal > 0.99))
+
+    def test_lama_adapter_only_replaces_explicit_mask_pixels(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            session = self.FakeSession(
+                [np.ones((1, 3, 4, 4), dtype=np.float32)],
+                [self.FakeInput("image", [1, 4, 4, 4])],
+            )
+            fake_ort = self.FakeOrt(session)
+            manifest = self._manifest(
+                root, role="image_inpainting", adapter="lama-inpaint-v1", input_size=[4, 4]
+            )
+            manifest.update({"output_range": "zero_one", "mask_semantics": "masked_one"})
+            rgb = np.full((12, 12, 3), (20, 40, 60), dtype=np.uint8)
+            mask = np.zeros((12, 12), dtype=np.uint8)
+            mask[5:7, 5:7] = 255
+            runtime = LocalModelRuntime(root)
+            with patch.object(runtime, "_ready", return_value=manifest), patch.object(
+                model_runtime_module, "ort", fake_ort
+            ):
+                repaired, diagnostics = runtime.inpaint_rgb(rgb, mask)
+
+            self.assertIsNotNone(repaired)
+            assert repaired is not None
+            self.assertEqual(diagnostics["status"], "ok")
+            self.assertEqual(session.last_inputs["image"].shape, (1, 4, 4, 4))
+            np.testing.assert_array_equal(repaired[mask == 0], rgb[mask == 0])
+            self.assertTrue(np.all(repaired[mask > 0] == 255))
 
     def test_vitmatte_refines_unknown_band_and_preserves_known_pixels(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

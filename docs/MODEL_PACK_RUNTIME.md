@@ -54,6 +54,17 @@ ViTMatte dùng ảnh RGB và trimap. Runtime hỗ trợ hai dạng ONNX export:
 
 Output được resize về ROI gốc rồi chỉ ghi vào unknown band. Vùng background/foreground chắc chắn và giới hạn `SOURCE_ALPHA` luôn được giữ lại.
 
+## LaMa-compatible watermark inpainting
+
+Watermark V2 nhận pack có `role: "image_inpainting"` và `adapter: "lama-inpaint-v1"`. Runtime chỉ chạy trên ROI bao quanh mask, sau đó chỉ ghi lại pixel có mask; pixel còn lại trong ROI và toàn ảnh giữ byte-exact.
+
+- Một-input: tensor 4 kênh `RGB + mask`, để trống `mask_input_name`.
+- Hai-input: đặt `mask_input_name` cho tensor mask một kênh.
+- `mask_semantics` mặc định là `"masked_one"`; dùng `"valid_one"` khi ONNX export đảo nghĩa mask.
+- `output_range` là `"zero_one"` hoặc `"minus_one_one"`.
+
+Pack LaMa chỉ được ký/phát hành sau khi quyền thương mại và phân phối của checkpoint cụ thể đã được xác minh; catalog hiện chỉ là candidate, không tự tải artifact chưa qualification.
+
 ## SAM2 tùy chọn
 
 SAM2 chỉ được dùng như lớp membership/topology. Model-pack phải là ONNX export có adapter `sam2-conditional-v1` hoặc `sam2-mask-prompt-v1`; nếu có mask prompt thì khai báo `prompt_input_name`. Runtime không dùng output SAM2 để tạo alpha fractional và sẽ bỏ qua topology nếu membership rỗng.

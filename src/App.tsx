@@ -18,6 +18,9 @@ import type {
   UpscaleScale,
   WandAlgorithm,
   WandPreview,
+  WatermarkFillEngine,
+  WatermarkPreviewJob,
+  WatermarkSession,
 } from "./types";
 
 const tools: Array<{ id: ToolMode; label: string; key: string; icon: string }> = [
@@ -51,6 +54,11 @@ export default function App() {
   const [wandSoftness, setWandSoftness] = useState(18);
   const [wandAlgorithm, setWandAlgorithm] = useState<WandAlgorithm>("SMART");
   const [wandPreview, setWandPreview] = useState<WandPreview | null>(null);
+  const [watermarkSession, setWatermarkSession] = useState<WatermarkSession | null>(null);
+  const [watermarkPreviewJob, setWatermarkPreviewJob] = useState<WatermarkPreviewJob | null>(null);
+  const [watermarkMaskMode, setWatermarkMaskMode] = useState<"ADD" | "ERASE">("ADD");
+  const [watermarkEngine, setWatermarkEngine] = useState<WatermarkFillEngine>("AUTO");
+  const [watermarkView, setWatermarkView] = useState<"ORIGINAL" | "MASK" | "RESULT">("MASK");
   const [radius, setRadius] = useState(20);
   const [hardness, setHardness] = useState(82);
   const [contiguous, setContiguous] = useState(true);
@@ -127,8 +135,40 @@ export default function App() {
   }, [enhancedJob]);
 
   useEffect(() => {
+    if (!watermarkPreviewJob || ["COMPLETED", "FAILED", "CANCELLED"].includes(watermarkPreviewJob.status)) return;
+    const timer = window.setTimeout(() => {
+      void coordinatorCall<WatermarkPreviewJob>("get_job", { job_id: watermarkPreviewJob.job_id })
+        .then((job) => {
+          setWatermarkPreviewJob(job);
+          if (job.status === "COMPLETED" && job.result) {
+            setWatermarkSession(job.result);
+            setWatermarkView("RESULT");
+            setMessage(`Preview watermark ${job.result.engine} đã sẵn sàng — kiểm tra trước khi áp dụng.`);
+          }
+          if (job.status === "FAILED") setError(job.error || "Preview watermark thất bại");
+        })
+        .catch((caught) => setError(friendlyError(caught)));
+    }, 550);
+    return () => window.clearTimeout(timer);
+  }, [watermarkPreviewJob]);
+
+  useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       // Khi Wand đang preview, Enter/Esc được ưu tiên để xác nhận hoặc hủy nhanh.
+      if (watermarkSession && !busy && !event.repeat && !event.isComposing) {
+        if (event.key === "Enter" && watermarkSession.status === "READY") {
+          event.preventDefault();
+          event.stopPropagation();
+          void commitWatermark();
+          return;
+        }
+        if (event.key === "Escape") {
+          event.preventDefault();
+          event.stopPropagation();
+          void cancelWatermark();
+          return;
+        }
+      }
       if (wandPreview && !busy && !event.repeat && !event.isComposing) {
         if (event.key === "Enter") {
           event.preventDefault();
@@ -168,6 +208,8 @@ export default function App() {
     if (imported) {
       setProject(imported);
       setWandPreview(null);
+      setWatermarkSession(null);
+      setWatermarkPreviewJob(null);
       setPreflight(null);
       setTool("pan");
       setForegroundPoints([]);
@@ -192,6 +234,8 @@ export default function App() {
     if (processed) {
       setProject(processed);
       setWandPreview(null);
+      setWatermarkSession(null);
+      setWatermarkPreviewJob(null);
       setPreflight(null);
       setTool(processed.process?.result_status === "NEEDS_PROTECTION"
         ? "protect"
@@ -220,12 +264,64 @@ export default function App() {
     if (edited) { setProject(edited); setPreflight(null); }
   };
 
-  const removeWatermark = async (mode: "AUTO" | "MANUAL", points: Array<{ x: number; y: number }> = []) => {
-    if (!project) return;
-    const edited = await run(mode === "AUTO" ? "Đang tìm và xóa watermark" : "Đang lấp vùng watermark", () => coordinatorCall<ProjectPayload>("remove_watermark", {
-      project_id: project.project_id, mode, points, radius,
+  const startWatermarkSession = async (mode: "AUTO" | "MANUAL"): Promise<WatermarkSession | null> => {
+    if (!project) return null;
+    if (watermarkSession) await cancelWatermark(false);
+    const session = await run(mode === "AUTO" ? "Đang tìm watermark" : "Đang tạo mask watermark", () => coordinatorCall<WatermarkSession>("start_watermark_session", {
+      project_id: project.project_id, mode,
     }));
-    if (edited) { setProject(edited); setPreflight(null); }
+    if (session) {
+      setWatermarkSession(session);
+      setWatermarkView(mode === "AUTO" ? "MASK" : "MASK");
+      setTool("watermark");
+    }
+    return session;
+  };
+
+  const previewWatermark = async (candidate = watermarkSession) => {
+    if (!project || !candidate) return;
+    const job = await run("Đang tạo preview lấp watermark", () => coordinatorCall<WatermarkPreviewJob>("start_watermark_preview", {
+      project_id: project.project_id, session_id: candidate.session_id, engine: watermarkEngine,
+    }));
+    if (job) {
+      setWatermarkPreviewJob(job);
+      setWatermarkSession({ ...candidate, status: "RUNNING" });
+    }
+  };
+
+  const beginAutoWatermark = async () => {
+    const session = await startWatermarkSession("AUTO");
+    if (session) await previewWatermark(session);
+  };
+
+  const editWatermarkMask = async (points: Array<{ x: number; y: number }>) => {
+    if (!project) return;
+    let session = watermarkSession;
+    if (!session) session = await startWatermarkSession("MANUAL");
+    if (!session) return;
+    const updated = await run(watermarkMaskMode === "ADD" ? "Đang thêm vùng watermark" : "Đang khôi phục khỏi mask", () => coordinatorCall<WatermarkSession>("update_watermark_mask", {
+      project_id: project.project_id, session_id: session.session_id, points, radius, mode: watermarkMaskMode,
+    }));
+    if (updated) { setWatermarkSession(updated); setWatermarkView("MASK"); }
+  };
+
+  const commitWatermark = async () => {
+    if (!project || !watermarkSession || watermarkSession.status !== "READY") return;
+    const edited = await run("Đang áp dụng lấp watermark", () => coordinatorCall<ProjectPayload>("commit_watermark_session", {
+      project_id: project.project_id, session_id: watermarkSession.session_id,
+    }));
+    if (edited) { setProject(edited); setWatermarkSession(null); setWatermarkPreviewJob(null); setPreflight(null); setTool("pan"); }
+  };
+
+  const cancelWatermark = async (showBusy = true) => {
+    if (!project || !watermarkSession) return;
+    const operation = () => coordinatorCall<{ cancelled: boolean }>("cancel_watermark_session", {
+      project_id: project.project_id, session_id: watermarkSession.session_id,
+    });
+    if (showBusy) await run("Đang hủy watermark preview", operation); else await operation().catch(() => undefined);
+    setWatermarkSession(null);
+    setWatermarkPreviewJob(null);
+    setWatermarkView("ORIGINAL");
   };
 
   const previewWand = async (point: { x: number; y: number }) => {
@@ -289,12 +385,12 @@ export default function App() {
   const undo = async () => {
     if (!project || !project.history.can_undo || busy) return;
     const result = await run("Undo", () => coordinatorCall<ProjectPayload>("undo", { project_id: project.project_id }));
-    if (result) { setProject(result); setWandPreview(null); }
+    if (result) { setProject(result); setWandPreview(null); setWatermarkSession(null); setWatermarkPreviewJob(null); }
   };
   const redo = async () => {
     if (!project || !project.history.can_redo || busy) return;
     const result = await run("Redo", () => coordinatorCall<ProjectPayload>("redo", { project_id: project.project_id }));
-    if (result) { setProject(result); setWandPreview(null); }
+    if (result) { setProject(result); setWandPreview(null); setWatermarkSession(null); setWatermarkPreviewJob(null); }
   };
 
   const installModelPack = async () => {
@@ -372,7 +468,16 @@ export default function App() {
   const upscaleRole = upscaleMode === "SHARP" && upscaleScale === 3 ? "upscale_sharp_x4" : `upscale_${upscaleMode.toLowerCase()}_x${upscaleScale}`;
   const upscaleReady = upscaleMode === "NONE" || installedModels.some((model) => model.role === upscaleRole);
   const stablePreviewPath = previewMode === "pod-clean" ? (project?.preview_pod_clean_path || project?.preview_path) : project?.preview_path;
-  const canvasProject = project && wandPreview
+  const watermarkPreviewPath = watermarkSession
+    ? watermarkView === "ORIGINAL"
+      ? stablePreviewPath
+      : watermarkView === "RESULT" && watermarkSession.preview_path
+        ? watermarkSession.preview_path
+        : watermarkSession.mask_preview_path
+    : null;
+  const canvasProject = project && watermarkSession && watermarkPreviewPath
+    ? { ...project, preview_path: watermarkPreviewPath, revision: `${watermarkSession.session_id}-${watermarkView}-${watermarkSession.status}` }
+    : project && wandPreview
     ? { ...project, preview_path: wandPreview.preview_path, revision: wandPreview.selection_id }
     : project ? { ...project, preview_path: stablePreviewPath || project.preview_path } : project;
 
@@ -395,7 +500,7 @@ export default function App() {
         </aside>
 
         <section className="stage">
-          {canvasProject ? <EditorCanvas project={canvasProject} tool={tool} radius={radius} background={background} backgroundColor={backgroundColor} disabled={!!busy} foregroundPoints={foregroundPoints} onBrush={applyBrush} onWand={previewWand} onSubject={selectSubjectAt} onProtect={lockForegroundPoint} onWatermark={(points) => removeWatermark("MANUAL", points)} /> : (
+          {canvasProject ? <EditorCanvas project={canvasProject} tool={tool} radius={radius} background={background} backgroundColor={backgroundColor} disabled={!!busy || watermarkSession?.status === "RUNNING"} foregroundPoints={foregroundPoints} onBrush={applyBrush} onWand={previewWand} onSubject={selectSubjectAt} onProtect={lockForegroundPoint} onWatermark={editWatermarkMask} /> : (
             <button className="empty-state" onClick={importImage}><span className="empty-art">✦</span><strong>Thả artwork vào đây</strong><span>PNG · JPEG · static WebP, tối đa bảo đảm 40 MP</span><em>Chọn ảnh</em></button>
           )}
           {busy && <div className="busy-overlay"><span className="spinner" />{busy}</div>}
@@ -405,6 +510,15 @@ export default function App() {
             <input aria-label="Màu nền tùy chọn" type="color" value={backgroundColor} onChange={(event) => { setBackgroundColor(event.target.value); setBackground("custom"); }} />
           </div>
           {wandPreview && <div className="wand-preview-bar"><span>{wandPreview.selected_pixel_count.toLocaleString()} px được chọn</span><button onClick={commitWand} title="Enter">Áp dụng ↵</button><button onClick={() => cancelWand()} title="Escape">Hủy Esc</button></div>}
+          {watermarkSession && <div className="wand-preview-bar watermark-preview-bar">
+            <span>{watermarkSession.mask_pixels.toLocaleString()} px mask · {watermarkSession.status === "RUNNING" ? "đang dựng preview" : watermarkSession.status === "READY" ? "preview sẵn sàng" : "chỉnh mask"}</span>
+            <button className={watermarkView === "ORIGINAL" ? "active" : ""} onClick={() => setWatermarkView("ORIGINAL")}>Gốc</button>
+            <button className={watermarkView === "MASK" ? "active" : ""} onClick={() => setWatermarkView("MASK")}>Mask</button>
+            <button className={watermarkView === "RESULT" ? "active" : ""} onClick={() => setWatermarkView("RESULT")} disabled={!watermarkSession.preview_path}>Kết quả</button>
+            <button onClick={() => previewWatermark()} disabled={watermarkSession.status === "RUNNING" || !!busy}>Tạo lại</button>
+            <button onClick={commitWatermark} disabled={watermarkSession.status !== "READY" || !!busy} title="Enter">Áp dụng ↵</button>
+            <button onClick={() => cancelWatermark()} disabled={!!busy} title="Escape">Hủy Esc</button>
+          </div>}
           <div className="background-picker" aria-label="Nền preview">{(["checker", "white", "black", "garment", "custom"] as const).map((item) => <button key={item} className={`${item} ${background === item ? "active" : ""}`} onClick={() => setBackground(item)} title={`Nền ${item}`} />)}</div>
         </section>
 
@@ -414,9 +528,15 @@ export default function App() {
           {panel === "controls" && <div className="panel-content">
             <section className="control-section">
               <div className="section-heading"><div><strong>XÓA WATERMARK</strong><small>Inpainting native — giữ nguyên kích thước pixel</small></div><span className="pill">LOCAL</span></div>
-              <button className="button primary full" onClick={() => removeWatermark("AUTO")} disabled={!project || !!busy}>Tự động tìm & xóa</button>
-              <div className="subject-actions"><button type="button" className={tool === "watermark" ? "active" : ""} onClick={() => setTool("watermark")}>Xóa bằng cọ (M)</button></div>
-              <p className="hint">Tự động chỉ chọn các nét chữ/logo nhỏ có tín hiệu watermark để tránh xóa nhầm artwork. Với watermark phức tạp, chọn Xóa bằng cọ, tô phủ toàn bộ watermark rồi thả chuột để lấp nền. Undo/Redo hoạt động cho cả hai chế độ.</p>
+              <button className="button primary full" onClick={beginAutoWatermark} disabled={!project || !!busy}>Tự động tìm & xem preview</button>
+              <div className="subject-actions">
+                <button type="button" className={tool === "watermark" ? "active" : ""} onClick={() => { void startWatermarkSession("MANUAL"); }}>Tạo mask bằng cọ (M)</button>
+                <button type="button" className={watermarkMaskMode === "ADD" ? "active" : ""} onClick={() => setWatermarkMaskMode("ADD")} disabled={!watermarkSession}>Thêm mask</button>
+                <button type="button" className={watermarkMaskMode === "ERASE" ? "active" : ""} onClick={() => setWatermarkMaskMode("ERASE")} disabled={!watermarkSession}>Xóa khỏi mask</button>
+              </div>
+              <label>Phương pháp lấp<select value={watermarkEngine} onChange={(event) => setWatermarkEngine(event.target.value as WatermarkFillEngine)} disabled={!watermarkSession || watermarkSession.status === "RUNNING"}><option value="AUTO">Tự chọn — hybrid</option><option value="FAST">Nhanh — nền đơn giản</option><option value="STRUCTURE_TEXTURE">Vân / đường biên</option><option value="AI_LOCAL" disabled={!installedModels.some((model) => model.role === "image_inpainting")}>AI local — cần model-pack</option></select></label>
+              {watermarkSession?.detection.needs_review ? <p className="hint">Detector chưa đủ chắc chắn; hãy xem Mask, thêm hoặc xóa vùng bằng cọ trước khi áp dụng.</p> : null}
+              <p className="hint">Tự động và cọ đều tạo mask không phá hủy. Chỉ khi xem preview và bấm Áp dụng thì RGB mới thay đổi; Undo/Redo vẫn hoạt động.</p>
               {project?.retouch?.watermark_removed ? <p className="success-note">Watermark đã được xử lý trong ảnh xuất.</p> : null}
             </section>
 

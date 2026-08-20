@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import platform
+import shutil
 import threading
 import time
 import uuid
@@ -32,18 +33,26 @@ from .processor import analyze_components, magic_wand_selection, select_componen
 from .project_store import ProjectStore, atomic_write_json
 from .model_runtime import LocalModelRuntime
 from .worker_supervisor import WorkerSupervisor
-from .watermark import automatic_watermark_mask, brush_mask, inpaint_watermark
+from .watermark import (
+    apply_mask_stroke,
+    automatic_watermark_mask,
+    brush_mask,
+    hybrid_inpaint_watermark,
+)
 
 
 class Coordinator:
     def __init__(self, store: ProjectStore | None = None) -> None:
         self.store = store or ProjectStore()
         self.worker = WorkerSupervisor()
+        self._worker_lock = threading.RLock()
         self.models_dir = Path(
             os.environ.get("CUTOUT_MODELS_DIR", Path(__file__).resolve().parents[2] / "models")
         ).resolve()
         self._jobs: dict[str, dict[str, Any]] = {}
         self._jobs_lock = threading.RLock()
+        self._watermark_sessions: dict[str, dict[str, Any]] = {}
+        self._watermark_sessions_lock = threading.RLock()
 
     def dispatch(self, method: str, params: dict[str, Any]) -> Any:
         handlers: dict[str, Callable[[dict[str, Any]], Any]] = {
@@ -52,6 +61,11 @@ class Coordinator:
             "get_project": self.get_project,
             "process_artwork": self.process_artwork,
             "remove_watermark": self.remove_watermark,
+            "start_watermark_session": self.start_watermark_session,
+            "update_watermark_mask": self.update_watermark_mask,
+            "start_watermark_preview": self.start_watermark_preview,
+            "commit_watermark_session": self.commit_watermark_session,
+            "cancel_watermark_session": self.cancel_watermark_session,
             "apply_brush": self.brush,
             "apply_magic_wand": self.magic_wand,
             "preview_magic_wand": self.preview_magic_wand,
@@ -74,6 +88,11 @@ class Coordinator:
         if not handler:
             raise ValueError(f"Method không hỗ trợ: {method}")
         return handler(params)
+
+    def _worker_request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        """Worker stdio is sequential; jobs and foreground processing share it safely."""
+        with self._worker_lock:
+            return self.worker.request(method, params)
 
     def health(self, _params: dict[str, Any]) -> dict[str, Any]:
         return {
@@ -139,7 +158,7 @@ class Coordinator:
         if protection_mode != "CONSERVATIVE" or shadow_policy != "REMOVE":
             raise ValueError("Cấu hình bảo toàn vật thể hoặc bóng không hợp lệ")
         staging_path = self.store.path(project_id) / "alpha" / "staging" / "worker-alpha.npy"
-        worker_result = self.worker.request(
+        worker_result = self._worker_request(
             "process_artwork",
             {
                 "canonical_path": str(self.store.canonical_path(project_id)),
@@ -214,25 +233,198 @@ class Coordinator:
         self._refresh_preview(project_id, self.store.read_working_rgb(project_id), alpha)
         return self._project_payload(project_id)
 
-    def remove_watermark(self, params: dict[str, Any]) -> dict[str, Any]:
-        project_id = params["project_id"]
+    @staticmethod
+    def _watermark_points(value: Any, width: int, height: int) -> list[dict[str, float]]:
+        if not isinstance(value, list) or not value or len(value) > 4096:
+            raise ValueError("Nét mask watermark phải có từ 1 đến 4096 điểm")
+        points: list[dict[str, float]] = []
+        for item in value:
+            if not isinstance(item, dict):
+                raise ValueError("Nét mask watermark không hợp lệ")
+            try:
+                x, y = float(item["x"]), float(item["y"])
+            except (KeyError, TypeError, ValueError) as error:
+                raise ValueError("Tọa độ mask watermark không hợp lệ") from error
+            if not np.isfinite(x) or not np.isfinite(y):
+                raise ValueError("Tọa độ mask watermark không hữu hạn")
+            points.append({"x": round(min(width - 0.5, max(0.5, x)), 3), "y": round(min(height - 0.5, max(0.5, y)), 3)})
+        return points
+
+    def _watermark_revision(self, project_id: str) -> tuple[int, int]:
+        manifest = self.store.manifest(project_id)
+        return (int(manifest.get("journal_sequence", 0)), int(manifest.get("history_cursor", 0)))
+
+    def _watermark_session(self, project_id: str, session_id: str) -> dict[str, Any]:
+        with self._watermark_sessions_lock:
+            session = self._watermark_sessions.get(session_id)
+        if not session or session["project_id"] != project_id:
+            raise FileNotFoundError("Phiên chỉnh watermark không tồn tại hoặc đã hết hạn")
+        return session
+
+    @staticmethod
+    def _write_mask_overlay(rgb: np.ndarray, mask: np.ndarray, destination: Path) -> None:
+        overlay = rgb.astype(np.float32).copy()
+        selected = mask > 0
+        overlay[selected] = overlay[selected] * 0.36 + np.array([68, 172, 255], dtype=np.float32) * 0.64
+        Image.fromarray(np.rint(overlay).astype(np.uint8), "RGB").save(destination, format="PNG")
+
+    def _watermark_session_payload(self, session: dict[str, Any]) -> dict[str, Any]:
+        with Image.open(session["mask_path"]) as image:
+            mask = np.asarray(image.convert("L"), dtype=np.uint8)
+        preview_path = session.get("preview_path")
+        return {
+            "session_id": session["session_id"], "project_id": session["project_id"],
+            "mask_preview_path": str(Path(session["mask_preview_path"]).resolve()),
+            "preview_path": str(Path(preview_path).resolve()) if preview_path else None,
+            "mask_pixels": int(np.count_nonzero(mask)), "bounds": list(self._watermark_bounds(mask)),
+            "detection": session["detection"], "status": session.get("status", "EDITING"),
+            "diagnostics": session.get("diagnostics"),
+        }
+
+    @staticmethod
+    def _watermark_bounds(mask: np.ndarray) -> tuple[int, int, int, int]:
+        ys, xs = np.nonzero(mask > 0)
+        return (0, 0, 0, 0) if not xs.size else (int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1)
+
+    def start_watermark_session(self, params: dict[str, Any]) -> dict[str, Any]:
+        project_id = str(params["project_id"])
         mode = str(params.get("mode", "AUTO")).upper()
+        if mode not in {"AUTO", "MANUAL"}:
+            raise ValueError("Chế độ xoá watermark không hợp lệ")
+        with self._watermark_sessions_lock:
+            for token, current in list(self._watermark_sessions.items()):
+                if current["project_id"] == project_id:
+                    self._discard_watermark_session(token)
         rgb = self.store.read_working_rgb(project_id)
         if mode == "AUTO":
             mask, detection = automatic_watermark_mask(rgb)
-            operation = {"tool": "watermark_auto", "algorithm_version": "opencv-telea-v1", "detection": detection}
+        else:
+            mask = np.zeros(rgb.shape[:2], dtype=np.uint8)
+            detection = {"pixels": 0, "bounds": [0, 0, 0, 0], "confidence": 1.0, "needs_review": False, "algorithm_version": "manual-mask-v2"}
+        token = uuid.uuid4().hex
+        directory = self.store.path(project_id) / "retouch" / "staging" / token
+        directory.mkdir(parents=True, exist_ok=False)
+        base_path, mask_path, mask_preview_path = directory / "base.png", directory / "mask.png", directory / "mask-preview.png"
+        Image.fromarray(rgb, "RGB").save(base_path, format="PNG")
+        Image.fromarray(mask, "L").save(mask_path, format="PNG")
+        self._write_mask_overlay(rgb, mask, mask_preview_path)
+        session = {
+            "session_id": token, "project_id": project_id, "revision": self._watermark_revision(project_id),
+            "directory": str(directory), "base_path": str(base_path), "mask_path": str(mask_path),
+            "mask_preview_path": str(mask_preview_path), "detection": detection, "status": "EDITING",
+            "preview_path": None, "diagnostics": None,
+        }
+        with self._watermark_sessions_lock:
+            self._watermark_sessions[token] = session
+        return self._watermark_session_payload(session)
+
+    def update_watermark_mask(self, params: dict[str, Any]) -> dict[str, Any]:
+        project_id, token = str(params["project_id"]), str(params["session_id"])
+        session = self._watermark_session(project_id, token)
+        if session["status"] == "RUNNING":
+            raise RuntimeError("Đợi preview watermark hoàn tất trước khi sửa mask")
+        with Image.open(session["base_path"]) as image:
+            rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
+        with Image.open(session["mask_path"]) as image:
+            mask = np.asarray(image.convert("L"), dtype=np.uint8)
+        points = self._watermark_points(params.get("points"), rgb.shape[1], rgb.shape[0])
+        updated = apply_mask_stroke(mask, points, float(params.get("radius", 24)), str(params.get("mode", "ADD")))
+        Image.fromarray(updated, "L").save(session["mask_path"], format="PNG")
+        self._write_mask_overlay(rgb, updated, Path(session["mask_preview_path"]))
+        session.update({"status": "EDITING", "preview_path": None, "diagnostics": None})
+        return self._watermark_session_payload(session)
+
+    def start_watermark_preview(self, params: dict[str, Any]) -> dict[str, Any]:
+        project_id, token = str(params["project_id"]), str(params["session_id"])
+        session = self._watermark_session(project_id, token)
+        if session["status"] == "RUNNING":
+            raise RuntimeError("Preview watermark đang chạy")
+        engine = str(params.get("engine", "AUTO")).upper()
+        job_id, cancel_event = uuid.uuid4().hex, threading.Event()
+        session["status"] = "RUNNING"
+        with self._jobs_lock:
+            self._jobs[job_id] = {"job_id": job_id, "project_id": project_id, "kind": "WATERMARK_PREVIEW", "status": "QUEUED", "created_at": time.time(), "cancel_event": cancel_event, "result": None, "error": None}
+
+        def execute() -> None:
+            with self._jobs_lock:
+                self._jobs[job_id]["status"] = "RUNNING"
+                self._jobs[job_id]["started_at"] = time.time()
+            try:
+                preview_path = Path(session["directory"]) / "preview.png"
+                worker_result = self._worker_request(
+                    "preview_watermark",
+                    {
+                        "source_path": session["base_path"], "mask_path": session["mask_path"],
+                        "output_path": str(preview_path), "engine": engine, "models_dir": str(self.models_dir),
+                    },
+                )
+                if cancel_event.is_set():
+                    raise InterruptedError("Đã hủy preview watermark")
+                diagnostics = worker_result["diagnostics"]
+                session.update({"status": "READY", "preview_path": str(preview_path), "diagnostics": diagnostics})
+                result = {**self._watermark_session_payload(session), "engine": diagnostics["selected_engine"], "fallback_reason": diagnostics.get("fallback_reason")}
+                with self._jobs_lock:
+                    self._jobs[job_id].update({"status": "COMPLETED", "result": result})
+            except InterruptedError:
+                session["status"] = "EDITING"
+                with self._jobs_lock:
+                    self._jobs[job_id]["status"] = "CANCELLED"
+            except Exception as error:
+                session["status"] = "EDITING"
+                with self._jobs_lock:
+                    self._jobs[job_id].update({"status": "FAILED", "error": f"{type(error).__name__}: {error}"})
+            finally:
+                with self._jobs_lock:
+                    self._jobs[job_id]["finished_at"] = time.time()
+
+        threading.Thread(target=execute, name=f"watermark-preview-{job_id[:8]}", daemon=True).start()
+        return self.get_job({"job_id": job_id})
+
+    def commit_watermark_session(self, params: dict[str, Any]) -> dict[str, Any]:
+        project_id, token = str(params["project_id"]), str(params["session_id"])
+        session = self._watermark_session(project_id, token)
+        if session.get("status") != "READY" or not session.get("preview_path"):
+            raise RuntimeError("Cần tạo preview watermark trước khi áp dụng")
+        if tuple(session["revision"]) != self._watermark_revision(project_id):
+            raise RuntimeError("Ảnh đã thay đổi; hãy tạo lại preview watermark")
+        before = self.store.read_working_rgb(project_id)
+        with Image.open(session["preview_path"]) as image:
+            after = np.asarray(image.convert("RGB"), dtype=np.uint8)
+        with Image.open(session["mask_path"]) as image:
+            mask = np.asarray(image.convert("L"), dtype=np.uint8)
+        bounds = self._watermark_bounds(mask)
+        diagnostics = session.get("diagnostics") or {}
+        operation = {"tool": "watermark_session", "algorithm_version": diagnostics.get("algorithm_version", "watermark-hybrid-v2"), "engine": diagnostics.get("selected_engine"), "detection": session["detection"], "diagnostics": diagnostics, "bounds": list(bounds)}
+        self.store.commit_retouch_edit(project_id, before, after, bounds, operation)
+        self._refresh_preview(project_id, after, self.store.read_alpha(project_id))
+        self._discard_watermark_session(token)
+        return self._project_payload(project_id)
+
+    def _discard_watermark_session(self, token: str) -> None:
+        session = self._watermark_sessions.pop(token, None)
+        if session:
+            shutil.rmtree(Path(session["directory"]), ignore_errors=True)
+
+    def cancel_watermark_session(self, params: dict[str, Any]) -> dict[str, Any]:
+        project_id, token = str(params["project_id"]), str(params["session_id"])
+        self._watermark_session(project_id, token)
+        self._discard_watermark_session(token)
+        return {"cancelled": True, "session_id": token}
+
+    def remove_watermark(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Legacy immediate path; the desktop UI uses preview sessions instead."""
+        project_id, mode = params["project_id"], str(params.get("mode", "AUTO")).upper()
+        rgb = self.store.read_working_rgb(project_id)
+        if mode == "AUTO":
+            mask, detection = automatic_watermark_mask(rgb)
         elif mode == "MANUAL":
-            points = self._processing_points(params.get("points"), rgb.shape[1], rgb.shape[0], "points")
-            mask = brush_mask(rgb.shape[:2], points, float(params.get("radius", 24)))
-            detection = {"pixels": int(np.count_nonzero(mask)), "bounds": []}
-            operation = {"tool": "watermark_manual", "algorithm_version": "opencv-telea-v1", "pixels": detection["pixels"]}
+            points = self._watermark_points(params.get("points"), rgb.shape[1], rgb.shape[0])
+            mask, detection = brush_mask(rgb.shape[:2], points, float(params.get("radius", 24))), {"pixels": 0, "confidence": 1.0}
         else:
             raise ValueError("Chế độ xoá watermark không hợp lệ")
-        repaired, bounds = inpaint_watermark(rgb, mask)
-        operation["bounds"] = list(bounds)
-        self.store.commit_retouch_edit(project_id, rgb, repaired, bounds, operation)
-        alpha = self.store.read_alpha(project_id)
-        self._refresh_preview(project_id, repaired, alpha)
+        repaired, bounds, diagnostics = hybrid_inpaint_watermark(rgb, mask, str(params.get("engine", "AUTO")), LocalModelRuntime(self.models_dir))
+        self.store.commit_retouch_edit(project_id, rgb, repaired, bounds, {"tool": "watermark_legacy", "algorithm_version": "watermark-hybrid-v2", "detection": detection, "diagnostics": diagnostics})
+        self._refresh_preview(project_id, repaired, self.store.read_alpha(project_id))
         return self._project_payload(project_id)
 
     def brush(self, params: dict[str, Any]) -> dict[str, Any]:

@@ -346,6 +346,79 @@ class LocalModelRuntime:
             array = array[:, :, ::-1]
         return np.rint(np.clip(array, 0.0, 1.0) * 255.0).astype(np.uint8)
 
+    def inpaint_rgb(
+        self, rgb: np.ndarray, mask: np.ndarray
+    ) -> tuple[np.ndarray | None, dict[str, Any]]:
+        """Run a signed LaMa-compatible image-inpainting pack on a local ROI.
+
+        Different ONNX exports expose either one 4-channel RGB+mask tensor or
+        separate image/mask inputs.  The manifest makes that distinction
+        explicit while this adapter never loads model repository code.
+        """
+        started = time.perf_counter()
+        manifest = self._ready("image_inpainting")
+        if manifest is None:
+            return None, {"status": "model_not_installed", "role": "image_inpainting"}
+        providers = self._providers(manifest)
+        if ort is None or not providers:
+            return None, {"status": "runtime_or_qualified_backend_unavailable", "role": "image_inpainting"}
+        try:
+            adapter = str(manifest.get("adapter", "")).lower()
+            if adapter not in {"lama-inpaint-v1", "lama", "generic-inpaint", "image-inpainting-v1"}:
+                return None, {"status": "unsupported_inpaint_adapter", "adapter": adapter}
+            if rgb.ndim != 3 or rgb.shape[2] != 3 or mask.shape != rgb.shape[:2]:
+                return None, {"status": "invalid_inpaint_input"}
+            ys, xs = np.nonzero(mask > 0)
+            if not xs.size:
+                return rgb.copy(), {"status": "empty_mask"}
+            padding = max(32, min(256, max(int(xs.max() - xs.min() + 1), int(ys.max() - ys.min() + 1)) * 2))
+            x0, y0 = max(0, int(xs.min()) - padding), max(0, int(ys.min()) - padding)
+            x1, y1 = min(rgb.shape[1], int(xs.max()) + 1 + padding), min(rgb.shape[0], int(ys.max()) + 1 + padding)
+            roi, roi_mask = rgb[y0:y1, x0:x1], (mask[y0:y1, x0:x1] > 0).astype(np.uint8)
+            session = self._session(manifest)
+            model_inputs = list(session.get_inputs())
+            if not model_inputs:
+                raise ValueError("Model inpainting không có input")
+            size = _input_size(manifest, (512, 512))
+            image_name = self._input_name(manifest, model_inputs, "input_name")
+            image_layout = _layout_from_input(manifest, model_inputs[0], channels=3)
+            image = _normalise_image(roi, size, manifest)
+            mask_image = np.asarray(
+                Image.fromarray(roi_mask * 255, "L").resize(size, Image.Resampling.NEAREST), dtype=np.float32
+            ) / 255.0
+            if str(manifest.get("mask_semantics", "masked_one")).lower() == "valid_one":
+                mask_image = 1.0 - mask_image
+            if len(model_inputs) >= 2 or manifest.get("mask_input_name"):
+                mask_name = self._input_name(manifest, model_inputs, "mask_input_name", index=1)
+                mask_layout = _layout_from_input(manifest, model_inputs[1], channels=1)
+                inputs = {image_name: _tensor(image, image_layout), mask_name: _tensor(mask_image, mask_layout)}
+            else:
+                # One-input LaMa exports conventionally concatenate RGB+mask.
+                layout = _layout_from_input(manifest, model_inputs[0], channels=4)
+                inputs = {image_name: _tensor(np.dstack((image, mask_image)), layout)}
+            output_name = manifest.get("output_name")
+            outputs = session.run([str(output_name)] if output_name else None, inputs)
+            output_index = int(manifest.get("output_index", 0))
+            if output_index < 0 or output_index >= len(outputs):
+                raise ValueError("Output index inpainting không hợp lệ")
+            generated = self._image_output(outputs[output_index], manifest)
+            generated = _resize_rgb(generated, (roi.shape[1], roi.shape[0]))
+            result = rgb.copy()
+            local = result[y0:y1, x0:x1]
+            local[roi_mask > 0] = generated[roi_mask > 0]
+            result[y0:y1, x0:x1] = local
+            return result, {
+                "status": "ok", "model_id": manifest.get("model_id"), "revision": manifest.get("revision"),
+                "adapter": adapter, "backend": session.get_providers()[0], "roi": [x0, y0, x1, y1],
+                "input_size": list(size), "latency_ms": round((time.perf_counter() - started) * 1000.0, 3),
+            }
+        except Exception as error:
+            return None, {
+                "status": "inference_failed", "role": "image_inpainting",
+                "error": f"{type(error).__name__}: {error}",
+                "latency_ms": round((time.perf_counter() - started) * 1000.0, 3),
+            }
+
     def upscale_rgb(
         self,
         rgb: np.ndarray,

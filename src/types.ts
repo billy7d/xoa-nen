@@ -4,6 +4,7 @@ export type OutputMode =
   | "ALPHA_ONLY";
 export type UpscaleMode = "NONE" | "FAITHFUL" | "SHARP";
 export type UpscaleScale = 1 | 2 | 3 | 4;
+export type WatermarkFillEngine = "AUTO" | "FAST" | "STRUCTURE_TEXTURE" | "AI_LOCAL";
 
 export type EngineProfile = "LEGACY_V1" | "V3_BALANCED" | "V3_AI_LOCAL";
 export type WandAlgorithm = "LEGACY_COLOR" | "SMART";
@@ -153,6 +154,23 @@ export interface WandPreview {
   wand_algorithm: WandAlgorithm;
 }
 
+export interface WatermarkSession {
+  session_id: string;
+  project_id: string;
+  mask_preview_path: string;
+  preview_path?: string | null;
+  mask_pixels: number;
+  bounds: [number, number, number, number];
+  detection: {
+    pixels: number;
+    bounds: [number, number, number, number];
+    confidence?: number;
+    needs_review?: boolean;
+  };
+  status: "EDITING" | "RUNNING" | "READY";
+  diagnostics?: Record<string, unknown> | null;
+}
+
 export interface HealthPayload {
   status: string;
   version: string;
@@ -183,5 +201,15 @@ export interface EnhancedExportJob {
   status: "QUEUED" | "RUNNING" | "CANCELLING" | "COMPLETED" | "FAILED" | "CANCELLED";
   created_at: number;
   result?: ExportResult | null;
+  error?: string | null;
+}
+
+export interface WatermarkPreviewJob {
+  job_id: string;
+  project_id: string;
+  kind: "WATERMARK_PREVIEW";
+  status: "QUEUED" | "RUNNING" | "CANCELLING" | "COMPLETED" | "FAILED" | "CANCELLED";
+  created_at: number;
+  result?: (WatermarkSession & { engine: WatermarkFillEngine; fallback_reason?: string | null }) | null;
   error?: string | null;
 }

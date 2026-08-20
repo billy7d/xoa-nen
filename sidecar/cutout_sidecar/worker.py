@@ -9,10 +9,12 @@ from pathlib import Path
 from typing import Any, TextIO
 
 import numpy as np
+from PIL import Image
 
 from .image_core import inference_srgb_copy, load_canonical_png
 from .model_runtime import LocalModelRuntime
 from .processor import artwork_alpha
+from .watermark import hybrid_inpaint_watermark
 
 
 def atomic_save_array(destination: Path, array: np.ndarray) -> None:
@@ -35,9 +37,34 @@ def atomic_save_array(destination: Path, array: np.ndarray) -> None:
 
 def process_request(request: dict[str, Any]) -> dict[str, Any]:
     method = request.get("method")
+    params = request.get("params") or {}
+    if method == "preview_watermark":
+        source_path = Path(params["source_path"]).expanduser().resolve()
+        mask_path = Path(params["mask_path"]).expanduser().resolve()
+        output_path = Path(params["output_path"]).expanduser().resolve()
+        if output_path.suffix.lower() != ".png":
+            raise ValueError("Worker preview watermark phải ghi PNG trong project staging")
+        with Image.open(source_path) as image:
+            rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
+        with Image.open(mask_path) as image:
+            mask = np.asarray(image.convert("L"), dtype=np.uint8)
+        runtime = LocalModelRuntime(Path(params.get("models_dir") or source_path.parents[3] / "models").resolve())
+        repaired, bounds, diagnostics = hybrid_inpaint_watermark(
+            rgb, mask, str(params.get("engine", "AUTO")), runtime
+        )
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = output_path.with_name(f".{output_path.stem}.{os.getpid()}.tmp.png")
+        try:
+            Image.fromarray(repaired, "RGB").save(temporary, format="PNG")
+            os.replace(temporary, output_path)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return {
+            "output_path": str(output_path), "bounds": list(bounds), "diagnostics": diagnostics,
+            "shape": list(repaired.shape), "worker_pid": os.getpid(),
+        }
     if method != "process_artwork":
         raise ValueError(f"Worker method không hỗ trợ: {method}")
-    params = request.get("params") or {}
     canonical_path = Path(params["canonical_path"]).expanduser().resolve()
     output_path = Path(params["output_path"]).expanduser().resolve()
     if output_path.suffix.lower() != ".npy":
