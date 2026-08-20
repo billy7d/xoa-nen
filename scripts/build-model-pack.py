@@ -41,11 +41,17 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--weight-license", required=True)
     parser.add_argument("--input-size", type=int, nargs=2, metavar=("WIDTH", "HEIGHT"), required=True)
     parser.add_argument("--input-name", required=True)
+    parser.add_argument("--image-input-name", default=None)
+    parser.add_argument("--mask-input-name", default=None)
+    parser.add_argument("--mask-input-layout", choices=("NCHW", "NHWC"), default=None)
     parser.add_argument("--output-name", required=True)
     parser.add_argument("--mean", type=float, nargs=3, metavar=("R", "G", "B"), required=True)
     parser.add_argument("--std", type=float, nargs=3, metavar=("R", "G", "B"), required=True)
     parser.add_argument("--priority", type=int, default=150)
     parser.add_argument("--output-activation", default="auto")
+    parser.add_argument("--normalization", default="imagenet")
+    parser.add_argument("--output-range", default="zero_one")
+    parser.add_argument("--source-url", default=None)
     parser.add_argument("--trimap-mode", default=None)
     parser.add_argument("--qualified-backend", action="append", default=["CPUExecutionProvider"])
     return parser
@@ -85,13 +91,14 @@ def main() -> int:
         "priority": args.priority,
         "input_size": list(args.input_size),
         "input_layout": "NCHW",
-        "normalization": "imagenet",
+        "normalization": args.normalization,
         "mean": list(args.mean),
         "std": list(args.std),
         "input_name": args.input_name,
         "output_name": args.output_name,
         "output_layout": "NCHW",
         "output_activation": args.output_activation,
+        "output_range": args.output_range,
         "output_semantics": "foreground",
         "qualified_backends": list(dict.fromkeys(args.qualified_backend)),
         "signature_key_id": key_id,
@@ -107,6 +114,15 @@ def main() -> int:
     }
     if args.trimap_mode:
         manifest["trimap_mode"] = args.trimap_mode
+    if args.image_input_name:
+        # Lưu tên input ảnh riêng để runtime hỗ trợ ONNX nhiều input một cách tường minh.
+        manifest["image_input_name"] = args.image_input_name
+    if args.mask_input_name:
+        manifest["mask_input_name"] = args.mask_input_name
+    if args.mask_input_layout:
+        manifest["mask_input_layout"] = args.mask_input_layout
+    if args.source_url:
+        manifest["source_url"] = args.source_url
     manifest["signature_ed25519"] = base64.b64encode(
         private_key.sign(_signature_payload(manifest))
     ).decode("ascii")

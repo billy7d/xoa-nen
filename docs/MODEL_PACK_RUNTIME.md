@@ -9,6 +9,8 @@
 
 Mọi model phải được đóng gói thành `.cutout-modelpack` có manifest, SHA-256 và chữ ký Ed25519 hợp lệ. Runtime không tải hoặc thực thi Python code của model; checkpoint PyTorch thô, đặc biệt `.pt` của SAM2, không được cài trực tiếp.
 
+`runtime_ready` chỉ xác nhận artifact, chữ ký, policy và backend đủ để chạy. `quality_qualified` chỉ được bật khi manifest đã qua corpus/metric Phase 0. UI và release tooling không được suy diễn quality từ `installed=true`.
+
 ## Contract manifest
 
 Các trường runtime quan trọng:
@@ -60,6 +62,34 @@ SAM2 chỉ được dùng như lớp membership/topology. Model-pack phải là 
 
 Việc chuyển checkpoint SAM2 sang ONNX, xác định input/output names và kiểm tra parity phải hoàn thành trước khi ký pack. Không đổi candidate thành `READY` chỉ vì ONNX load được.
 
+## Watermark inpainting
+
+Watermark Removal v2 dùng cùng `LocalModelRuntime`, không có runtime AI riêng. Role hiện được hỗ trợ:
+
+- `watermark_inpaint_fast`: adapter `lama-v1`, ưu tiên cho ROI watermark vừa/lớn khi model-pack đã cài.
+- `watermark_inpaint_quality`: adapter `lama-v1` hoặc `generic-inpaint`, tùy chọn cho Maximum Quality sau qualification riêng.
+
+Manifest phải khai báo hoặc để runtime tự dò:
+
+```json
+{
+  "role": "watermark_inpaint_fast",
+  "adapter": "lama-v1",
+  "image_input_name": "image",
+  "mask_input_name": "mask",
+  "output_name": "output",
+  "input_size": [1024, 1024],
+  "input_layout": "NCHW",
+  "mask_input_layout": "NCHW",
+  "normalization": "zero_one",
+  "output_layout": "NCHW",
+  "output_range": "zero_one",
+  "qualified_backends": ["CUDAExecutionProvider", "DmlExecutionProvider", "CPUExecutionProvider"]
+}
+```
+
+Runtime chỉ gửi ROI đã mở rộng theo mask, rồi composite về ảnh native bằng soft mask. Pixel ngoài ROI/blend ring phải giữ nguyên byte-for-byte. Nếu role chưa cài, backend không lỗi app; router fallback sang Deblend/Patch/Telea local.
+
 ## Trạng thái hiện tại
 
 Checkout local đã cài hai pack ONNX trong thư mục bị bỏ qua bởi Git `models/`:
@@ -67,4 +97,4 @@ Checkout local đã cài hai pack ONNX trong thư mục bị bỏ qua bởi Git 
 - `studioludens-birefnet-lite-512`, revision `4a3c40c36c94093cc1e724d9ea428b8fa4b57dc7`, license MIT, tạo proposal bằng CPU.
 - `xenova-vitmatte-small-composition-1k`, revision `6bc1297f6140f055a227b6d2cfe8c093281f35d2`, model gốc Apache-2.0, refine unknown ROI bằng CPU.
 
-Smoke test qua worker đã gọi cả hai model, output float32 hữu hạn trong `[0, 1]`; latency mẫu trên CPU lần lượt khoảng 5,8 giây và 2,2 giây cho ảnh 128×96. SAM2 chưa cài artifact ONNX nên topology giữ trạng thái tùy chọn và không chặn pipeline. Đây là qualification ở mức runtime, chưa phải release qualification: cần chạy Phase 0 trên corpus riêng trước khi dùng cho POD thương mại.
+Smoke test qua worker đã gọi cả hai model, output float32 hữu hạn trong `[0, 1]`. SAM2 và watermark inpainting chưa cài artifact ONNX nên topology/inpaint AI giữ trạng thái tùy chọn và không chặn pipeline. Hai pack hiện chỉ là `runtime_ready_quality_pending`; cần chạy Phase 0 trên corpus riêng và A/B ViTMatte FP32/FP16 với bản QUInt8 trước khi dùng cho POD thương mại.

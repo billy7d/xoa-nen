@@ -4,17 +4,20 @@ Không đổi candidate thành default chỉ vì load được model. Mỗi arti
 
 ## Dataset
 
-- Tối thiểu 100 ảnh sở hữu hợp pháp, báo cáo riêng hard edge, text, line art, distressed, detached component, glow/gradient, white/black background, low contrast và anti-alias.
+- Tối thiểu 150 ảnh sở hữu hợp pháp, trong đó ít nhất 50 cảnh transparent/translucent; báo cáo riêng hard edge, text, line art, distressed, detached component, glow/gradient, white/black background, low contrast và anti-alias.
 - Ground-truth matte 16-bit; split cố định và hash danh sách file.
 - Composite QA trên trắng, đen và ít nhất ba màu garment.
+- Split transparent theo SKU và phiên chụp; test riêng 1/3/4+ vật thể, nắp/ống/rail, specular, refraction, chi tiết đầu/bên/dưới và lỗ âm 3/7/15/25/45 px.
 
 ## Gate chất lượng
 
 - Hard-edge Boundary F1 ±2 px ≥ 0,98.
 - Soft/complex Boundary F1 ±4 px ≥ 0,93.
 - Recall component có kích thước ≥4 px ≥98%.
+- Transparent báo SAD, MSE, Gradient, Connectivity, hole IoU và composite error; không dùng proxy gradient nguồn làm ground-truth metric.
 - Backend tăng tốc giảm Boundary F1 không quá 0,5 điểm phần trăm so với CPU FP32.
 - Kiểm riêng source alpha, hidden RGB và topology/negative space.
+- RGBA mặc định phải thỏa `output_alpha <= source_alpha`; phục hồi cutout cũ là một mode và corpus riêng.
 
 ## Gate máy đích
 
@@ -29,7 +32,7 @@ Không đổi candidate thành default chỉ vì load được model. Mỗi arti
 2. SAM 2.1 Base+ chỉ cho membership/topology có prompt, không ghi fractional alpha.
 3. ViTMatte-B ROI 512; ViTMatte-S fallback.
 4. BiRefNet HR chỉ cho MAX/profile đã benchmark.
-5. BEN2 Base và FeyNoBg là challenger; BRIA RMBG không bundle cho commercial POD.
+5. BEN2 Base và withoutBG là challenger có license phải audit theo từng artifact; BRIA RMBG không bundle cho commercial POD.
 
 File report Phase 0 phải lưu runtime/driver/OS, peak memory, latency từng stage, metric từng category, model manifest và mọi fallback. Profile bị invalidate khi model, preprocess, runtime, driver hoặc OS đổi.
 

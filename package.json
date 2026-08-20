@@ -9,7 +9,7 @@
     "build:desktop-assets": "npm run build && npm run build:sidecar",
     "preview": "vite preview",
     "tauri": "tauri",
-    "build:sidecar": "sh scripts/build-sidecar.sh",
+    "build:sidecar": "node scripts/build-sidecar.mjs",
     "test:navigation": "node --experimental-strip-types --test tests/canvas_navigation.test.ts",
     "test:sidecar": "bash scripts/test-sidecar.sh",
     "check": "npm run build && npm run test:navigation && npm run test:sidecar"

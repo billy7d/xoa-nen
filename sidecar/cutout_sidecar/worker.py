@@ -9,10 +9,12 @@ from pathlib import Path
 from typing import Any, TextIO
 
 import numpy as np
+from PIL import Image
 
 from .image_core import inference_srgb_copy, load_canonical_png
 from .model_runtime import LocalModelRuntime
 from .processor import artwork_alpha
+from .watermark_engine import confidence_to_soft_mask, detect_watermark, restore_watermark
 
 
 def atomic_save_array(destination: Path, array: np.ndarray) -> None:
@@ -33,22 +35,94 @@ def atomic_save_array(destination: Path, array: np.ndarray) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def atomic_save_rgb(destination: Path, rgb: np.ndarray) -> None:
+    destination = destination.expanduser().resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.", suffix=".png", dir=destination.parent
+    )
+    os.close(descriptor)
+    temporary = Path(temporary_name)
+    try:
+        Image.fromarray(np.ascontiguousarray(rgb, dtype=np.uint8), "RGB").save(temporary, format="PNG")
+        with temporary.open("r+b") as stream:
+            os.fsync(stream.fileno())
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def load_rgb_image(path: Path) -> np.ndarray:
+    with Image.open(path) as image:
+        return np.ascontiguousarray(np.asarray(image.convert("RGB"), dtype=np.uint8))
+
+
 def process_request(request: dict[str, Any]) -> dict[str, Any]:
     method = request.get("method")
+    params = request.get("params") or {}
+    if method == "analyze_watermark":
+        image_path = Path(params["image_path"]).expanduser().resolve()
+        output_path = Path(params["output_path"]).expanduser().resolve()
+        rgb = load_rgb_image(image_path)
+        detection = detect_watermark(rgb)
+        mask = confidence_to_soft_mask(
+            detection.confidence,
+            feather=float(params.get("feather", 8.0)),
+            expand=str(params.get("expand", "MEDIUM")),
+        )
+        atomic_save_array(output_path, mask)
+        return {
+            "output_path": str(output_path),
+            "shape": list(mask.shape),
+            "diagnostics": detection.diagnostics,
+            "worker_pid": os.getpid(),
+        }
+    if method == "restore_watermark":
+        image_path = Path(params["image_path"]).expanduser().resolve()
+        mask_path = Path(params["mask_path"]).expanduser().resolve()
+        output_path = Path(params["output_path"]).expanduser().resolve()
+        rgb = load_rgb_image(image_path)
+        mask = np.load(mask_path, allow_pickle=False).astype(np.float32)
+        runtime = LocalModelRuntime(
+            Path(params.get("models_dir") or image_path.parents[3] / "models").resolve()
+        )
+        repaired, bounds, diagnostics = restore_watermark(
+            rgb,
+            mask,
+            quality=str(params.get("quality", "BALANCED")),
+            runtime=runtime,
+        )
+        atomic_save_rgb(output_path, repaired)
+        return {
+            "output_path": str(output_path),
+            "bounds": list(bounds),
+            "diagnostics": diagnostics,
+            "worker_pid": os.getpid(),
+        }
     if method != "process_artwork":
         raise ValueError(f"Worker method không hỗ trợ: {method}")
-    params = request.get("params") or {}
     canonical_path = Path(params["canonical_path"]).expanduser().resolve()
     output_path = Path(params["output_path"]).expanduser().resolve()
     if output_path.suffix.lower() != ".npy":
         raise ValueError("Worker output phải là file .npy trong project staging")
     canonical_rgb, source_alpha, icc = load_canonical_png(canonical_path)
-    rgb, inference_color_converted = inference_srgb_copy(canonical_rgb, icc)
+    working_rgb_path = params.get("working_rgb_path")
+    if working_rgb_path:
+        rgb = load_rgb_image(Path(working_rgb_path).expanduser().resolve())
+        inference_color_converted = False
+    else:
+        rgb, inference_color_converted = inference_srgb_copy(canonical_rgb, icc)
     engine_profile = str(params.get("engine_profile", "V3_BALANCED")).upper()
     foreground_points = params.get("foreground_points") or []
     background_points = params.get("background_points") or []
+    selection_points = params.get("subject_selection_points")
+    quality_preset = str(params.get("quality_preset", "QUALITY")).upper()
+    subject_policy = str(params.get("subject_policy", "ALL_DETECTED")).upper()
+    source_alpha_mode = str(params.get("source_alpha_mode", "PRESERVE")).upper()
     if not isinstance(foreground_points, list) or not isinstance(background_points, list):
         raise ValueError("foreground_points/background_points phải là danh sách")
+    if selection_points is not None and not isinstance(selection_points, list):
+        raise ValueError("subject_selection_points phải là danh sách hoặc null")
     runtime = LocalModelRuntime(
         Path(params.get("models_dir") or canonical_path.parents[3] / "models").resolve()
     )
@@ -56,7 +130,11 @@ def process_request(request: dict[str, Any]) -> dict[str, Any]:
     semantic_diagnostics: dict[str, Any] = {"status": "not_requested"}
     topology_diagnostics: dict[str, Any] = {"status": "not_requested"}
     if engine_profile == "V3_AI_LOCAL":
-        semantic_alpha, semantic_diagnostics = runtime.semantic_proposal(rgb, foreground_points)
+        semantic_alpha, semantic_diagnostics = runtime.semantic_proposal(
+            rgb,
+            foreground_points,
+            auto_detail=quality_preset == "QUALITY",
+        )
         if semantic_alpha is not None:
             topology_alpha, topology_diagnostics = runtime.topology_proposal(
                 rgb,
@@ -87,13 +165,16 @@ def process_request(request: dict[str, Any]) -> dict[str, Any]:
         source_alpha,
         tolerance=float(params.get("tolerance", 30.0)),
         softness=float(params.get("softness", 18.0)),
-        quality_preset=str(params.get("quality_preset", "QUALITY")),
+        quality_preset=quality_preset,
         engine_profile=engine_profile,
         semantic_alpha=semantic_alpha,
         foreground_points=foreground_points,
         background_points=background_points,
+        selection_points=selection_points,
         protection_mode=str(params.get("protection_mode", "CONSERVATIVE")),
         shadow_policy=str(params.get("shadow_policy", "REMOVE")),
+        subject_policy=subject_policy,
+        source_alpha_mode=source_alpha_mode,
         return_guidance=True,
     )
     matting_diagnostics: dict[str, Any] = {"status": "not_requested"}
@@ -118,9 +199,34 @@ def process_request(request: dict[str, Any]) -> dict[str, Any]:
         "matting": matting_diagnostics,
     }
     diagnostics["ai_models_used"] = ai_models_used
-    if engine_profile == "V3_AI_LOCAL" and semantic_alpha is None:
-        diagnostics["fallback_reason"] = semantic_diagnostics.get("status", "ai_unavailable")
-        diagnostics["selected_strategy"] += "+ai_fallback"
+    if engine_profile == "V3_AI_LOCAL":
+        matting_status = str(matting_diagnostics.get("status", "unavailable"))
+        matting_completed = matting_status in {"ok", "no_unknown_roi"}
+        if semantic_alpha is None:
+            diagnostics["ai_pipeline_status"] = "fallback"
+            diagnostics["fallback_reason"] = semantic_diagnostics.get("status", "ai_unavailable")
+            diagnostics["selected_strategy"] += "+ai_fallback"
+        elif not matting_completed:
+            # Proposal đơn lẻ gần như mask nhị phân; lỗi matte phải được báo rõ.
+            diagnostics["ai_pipeline_status"] = "degraded"
+            diagnostics["needs_review"] = True
+            diagnostics["needs_protection"] = True
+            diagnostics["result_status"] = "NEEDS_PROTECTION"
+            diagnostics["fallback_reason"] = (
+                f"matting_{matting_diagnostics.get('status', 'unavailable')}"
+            )
+        else:
+            diagnostics["ai_pipeline_status"] = "complete"
+            required_stages = [semantic_diagnostics]
+            if topology_diagnostics.get("status") == "ok" and topology_diagnostics.get("applied"):
+                required_stages.append(topology_diagnostics)
+            if matting_status in {"ok", "no_unknown_roi"}:
+                required_stages.append(matting_diagnostics)
+            diagnostics["ai_quality_status"] = (
+                "qualified"
+                if all(bool(stage.get("quality_qualified")) for stage in required_stages)
+                else "pending"
+            )
     if not np.all(np.isfinite(alpha)):
         raise ValueError("Worker tạo alpha NaN/Inf")
     atomic_save_array(output_path, alpha)

@@ -8,7 +8,11 @@ export type UpscaleScale = 1 | 2 | 3 | 4;
 export type EngineProfile = "LEGACY_V1" | "V3_BALANCED" | "V3_AI_LOCAL";
 export type WandAlgorithm = "LEGACY_COLOR" | "SMART";
 export type SubjectPolicy = "ALL_DETECTED" | "SELECTED";
+export type SourceAlphaMode = "PRESERVE" | "RECOVER_PRIOR_CUTOUT";
 export type QualityPreset = "FAST" | "QUALITY";
+export type WatermarkQuality = "FAST" | "BALANCED" | "MAXIMUM";
+export type WatermarkBrushMode = "ADD" | "SUBTRACT";
+export type WatermarkExpand = "OFF" | "LOW" | "MEDIUM" | "HIGH";
 export type ToolMode = "pan" | "subject" | "protect" | "keep" | "remove" | "wand-keep" | "wand-remove" | "watermark";
 
 export interface ForegroundPoint {
@@ -20,6 +24,7 @@ export interface SubjectCandidate {
   id: number;
   area_px: number;
   bbox: [number, number, number, number];
+  seed_point?: [number, number];
   needs_review: boolean;
   selected: boolean;
   confidence: "detected" | "review";
@@ -80,8 +85,10 @@ export interface ProjectPayload {
     engine_profile: EngineProfile | "V2_ARCHIVED_RESULT";
     quality_preset: QualityPreset;
     subject_policy: SubjectPolicy;
+    source_alpha_mode?: SourceAlphaMode;
     foreground_points?: ForegroundPoint[];
     background_points?: ForegroundPoint[];
+    subject_selection_points?: ForegroundPoint[] | null;
     protection_mode?: "CONSERVATIVE";
     shadow_policy?: "REMOVE";
     result_status?: "READY" | "NEEDS_PROTECTION";
@@ -92,7 +99,12 @@ export interface ProjectPayload {
     review_regions: ReviewRegion[];
   } | null;
   warnings?: string[];
-  retouch?: { watermark_removed: boolean };
+  retouch?: {
+    watermark_removed: boolean;
+    active_watermark_edits?: number;
+    revision?: number;
+    last_engine?: string | null;
+  };
 }
 
 export interface PreflightItem {
@@ -142,6 +154,9 @@ export interface ModelManifest {
   signature_valid?: boolean;
   checksum_valid?: boolean;
   policy_valid?: boolean;
+  runtime_ready?: boolean;
+  quality_qualified?: boolean;
+  declared_status?: string | null;
 }
 
 export interface WandPreview {
@@ -151,6 +166,24 @@ export interface WandPreview {
   bounds: [number, number, number, number];
   mode: "keep" | "remove";
   wand_algorithm: WandAlgorithm;
+}
+
+export interface WatermarkSession {
+  session_id: string;
+  project_id: string;
+  quality: WatermarkQuality;
+  feather: number;
+  expand: WatermarkExpand;
+  mask_preview_path: string;
+  mask_pixel_count: number;
+  strong_pixel_count: number;
+  bounds: [number, number, number, number];
+  source: "EMPTY" | "AUTO" | "MANUAL" | "MIXED";
+  status: "EDITING" | "READY";
+  preview_path?: string | null;
+  preview_diagnostics?: Record<string, unknown> | null;
+  revision: string;
+  diagnostics: Record<string, unknown>;
 }
 
 export interface HealthPayload {

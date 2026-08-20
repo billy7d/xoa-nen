@@ -11,6 +11,11 @@ from PIL import Image, ImageFilter
 from .models import list_model_manifests
 
 try:
+    import cv2  # type: ignore
+except ImportError:  # pragma: no cover - requirements runtime luôn có OpenCV.
+    cv2 = None
+
+try:
     import onnxruntime as ort  # type: ignore
 except ImportError:  # pragma: no cover - explicit fallback in source-only development.
     ort = None
@@ -49,6 +54,28 @@ def _hann_weight(height: int, width: int) -> np.ndarray:
     if height <= 1 or width <= 1:
         return np.ones((height, width), dtype=np.float32)
     return np.outer(np.hanning(height), np.hanning(width)).astype(np.float32) + 1e-3
+
+
+def _detail_tile_weight(
+    height: int,
+    width: int,
+    source_edges: tuple[bool, bool, bool, bool],
+) -> np.ndarray:
+    """Feather seam nội bộ nhưng giữ weight=1 ở mép tile trùng mép ảnh nguồn."""
+    if height <= 1 or width <= 1:
+        return np.ones((height, width), dtype=np.float32)
+    left, top, right, bottom = source_edges
+    weight_x = np.hanning(width).astype(np.float32) + 1e-3
+    weight_y = np.hanning(height).astype(np.float32) + 1e-3
+    if left:
+        weight_x[: (width + 1) // 2] = 1.0
+    if right:
+        weight_x[width // 2 :] = 1.0
+    if top:
+        weight_y[: (height + 1) // 2] = 1.0
+    if bottom:
+        weight_y[height // 2 :] = 1.0
+    return np.minimum(np.outer(weight_y, weight_x), 1.0).astype(np.float32)
 
 
 def _sigmoid_if_needed(values: np.ndarray) -> np.ndarray:
@@ -183,13 +210,209 @@ def _focus_tile_bounds(
     vertical_bias: float,
 ) -> tuple[int, int, int, int]:
     """Tạo tile chồng lấn quanh click để Lite 512 nhìn rõ chi tiết mảnh."""
-    tile_width = min(width, max(input_size[0], round(width * 0.80)))
-    tile_height = min(height, max(input_size[1], round(height * 0.80)))
+    # Không dùng tile 80% ảnh vì gần như lặp lại full-frame 512 và không tăng chi tiết thật.
+    tile_width = min(
+        width,
+        max(input_size[0], min(round(width * 0.40), round(input_size[0] * 1.25))),
+    )
+    tile_height = min(
+        height,
+        max(input_size[1], min(round(height * 0.40), round(input_size[1] * 1.25))),
+    )
     center_x = point[0]
     center_y = point[1] + vertical_bias * tile_height
     x0 = min(max(0, int(round(center_x - tile_width / 2))), max(0, width - tile_width))
     y0 = min(max(0, int(round(center_y - tile_height / 2))), max(0, height - tile_height))
     return x0, y0, x0 + tile_width, y0 + tile_height
+
+
+def _auto_detail_tile_specs(
+    proposal: np.ndarray,
+    input_size: tuple[int, int],
+    max_tiles: int,
+) -> list[tuple[tuple[int, int, int, int], tuple[float, float]]]:
+    """Tạo tile ở phần đầu mỗi vật thể lớn để cứu nắp, tóc và phụ kiện mảnh."""
+    if cv2 is None or max_tiles <= 0:
+        return []
+    height, width = proposal.shape
+    silhouette = (proposal >= 0.50).astype(np.uint8)
+    count, component_labels, stats, _ = cv2.connectedComponentsWithStats(
+        silhouette, connectivity=8
+    )
+    minimum_area = max(64, round(height * width * 0.002))
+    components: list[tuple[int, int, int, int, int, int]] = []
+    for label in range(1, count):
+        x = int(stats[label, cv2.CC_STAT_LEFT])
+        y = int(stats[label, cv2.CC_STAT_TOP])
+        component_width = int(stats[label, cv2.CC_STAT_WIDTH])
+        component_height = int(stats[label, cv2.CC_STAT_HEIGHT])
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        if area >= minimum_area and component_width >= 8 and component_height >= 8:
+            components.append((area, label, x, y, component_width, component_height))
+    components.sort(key=lambda item: (-item[0], item[2], item[3]))
+
+    tiles: list[tuple[tuple[int, int, int, int], tuple[float, float]]] = []
+    base_span = max(32, round(min(input_size) * 0.75))
+    maximum_span = max(base_span, round(max(input_size) * 1.25))
+    for _, label, x, y, component_width, _ in components:
+        span = min(maximum_span, max(base_span, component_width))
+        tile_width = min(width, span)
+        tile_height = min(height, span)
+        # Đặt mép trên cao hơn silhouette để model vẫn thấy ngữ cảnh nền quanh chi tiết trong.
+        y0 = min(max(0, round(y - tile_height * 0.13)), max(0, height - tile_height))
+        required = max(1, int(np.ceil(component_width / max(1.0, tile_width * 0.82))))
+        required = min(required, max_tiles - len(tiles))
+        if required <= 0:
+            break
+        if required == 1:
+            centers = [x + component_width / 2.0]
+        else:
+            centers = np.linspace(
+                x + tile_width / 2.0,
+                x + component_width - tile_width / 2.0,
+                required,
+            )
+        for center_x in centers:
+            x0 = min(
+                max(0, round(float(center_x) - tile_width / 2.0)),
+                max(0, width - tile_width),
+            )
+            bounds = (x0, y0, x0 + tile_width, y0 + tile_height)
+            local_y, local_x = np.nonzero(
+                component_labels[y0 : y0 + tile_height, x0 : x0 + tile_width] == label
+            )
+            if not local_x.size:
+                continue
+            target_x = tile_width / 2.0
+            target_y = min(tile_height - 1.0, max(0.0, y - y0 + tile_height * 0.12))
+            nearest = int(np.argmin((local_x - target_x) ** 2 + (local_y - target_y) ** 2))
+            parent_seed = (float(x0 + local_x[nearest]), float(y0 + local_y[nearest]))
+            spec = (bounds, parent_seed)
+            if spec not in tiles:
+                tiles.append(spec)
+            if len(tiles) >= max_tiles:
+                return tiles
+    return tiles
+
+
+def _merge_supported_detail(
+    base: np.ndarray,
+    detail: np.ndarray,
+    parent_point: tuple[float, float] | None = None,
+    blend_weight: np.ndarray | None = None,
+) -> np.ndarray:
+    """Chỉ nhận component detail có giao với vật thể gốc và feather mép tile."""
+    if base.shape != detail.shape:
+        raise ValueError("Detail tile và proposal gốc phải cùng kích thước")
+    if cv2 is None:
+        return base
+    detail_candidate = (detail >= 0.02).astype(np.uint8)
+    count, labels = cv2.connectedComponents(detail_candidate, connectivity=8)
+    if count <= 1:
+        return base
+    base_count, base_labels, base_stats, _ = cv2.connectedComponentsWithStats(
+        (base >= 0.50).astype(np.uint8), connectivity=8
+    )
+    if base_count <= 1:
+        return base
+    parent_label = 0
+    if parent_point is not None:
+        parent_x = min(base.shape[1] - 1, max(0, round(parent_point[0])))
+        parent_y = min(base.shape[0] - 1, max(0, round(parent_point[1])))
+        parent_label = int(base_labels[parent_y, parent_x])
+    if parent_label <= 0:
+        # Fallback chỉ dùng khi caller cũ không truyền seed component.
+        parent_label = 1 + int(np.argmax(base_stats[1:, cv2.CC_STAT_AREA]))
+    anchor_labels = np.unique(labels[base_labels == parent_label])
+    anchor_labels = anchor_labels[anchor_labels > 0]
+    if not anchor_labels.size:
+        return base
+    supported = np.isin(labels, anchor_labels)
+    # Chặn component dính mảnh kéo dài vô hạn; 5% tile vẫn đủ cho rail nắp bị thiếu 10-16 px.
+    growth_limit = max(8.0, min(32.0, min(base.shape) * 0.05))
+    distance = cv2.distanceTransform((base < 0.02).astype(np.uint8), cv2.DIST_L2, 5)
+    supported &= (base >= 0.02) | (distance <= growth_limit)
+    # Giữ nguyên các lỗ background kín đã có trong proposal; max-merge không được lấp quai/lỗ âm.
+    supported &= ~_enclosed_background_mask(base)
+    filtered = np.where(supported, detail, 0.0).astype(np.float32)
+    fused = np.maximum(base, filtered)
+    weight = (
+        np.minimum(_hann_weight(base.shape[0], base.shape[1]), 1.0)
+        if blend_weight is None
+        else np.clip(blend_weight, 0.0, 1.0)
+    )
+    return (base + (fused - base) * weight).astype(np.float32)
+
+
+def _merge_prompted_detail(
+    base: np.ndarray,
+    detail: np.ndarray,
+    prompt_point: tuple[float, float],
+    blend_weight: np.ndarray | None = None,
+) -> np.ndarray:
+    """Nhận component detail tại click kể cả full-frame đã bỏ sót hoàn toàn."""
+    if base.shape != detail.shape:
+        raise ValueError("Detail tile và proposal gốc phải cùng kích thước")
+    if cv2 is None:
+        return base
+    detail_candidate = (detail >= 0.02).astype(np.uint8)
+    count, labels = cv2.connectedComponents(detail_candidate, connectivity=8)
+    if count <= 1:
+        return base
+    x = min(base.shape[1] - 1, max(0, round(prompt_point[0])))
+    y = min(base.shape[0] - 1, max(0, round(prompt_point[1])))
+    label = int(labels[y, x])
+    if label <= 0:
+        search_radius = max(4, min(24, round(min(base.shape) * 0.04)))
+        x0, x1 = max(0, x - search_radius), min(base.shape[1], x + search_radius + 1)
+        y0, y1 = max(0, y - search_radius), min(base.shape[0], y + search_radius + 1)
+        neighbourhood = detail[y0:y1, x0:x1]
+        if np.max(neighbourhood, initial=0.0) < 0.02:
+            return base
+        local_y, local_x = np.unravel_index(int(np.argmax(neighbourhood)), neighbourhood.shape)
+        label = int(labels[y0 + local_y, x0 + local_x])
+    if label <= 0:
+        return base
+    supported = labels == label
+    growth_limit = max(8.0, min(32.0, min(base.shape) * 0.05))
+    distance = cv2.distanceTransform((base < 0.02).astype(np.uint8), cv2.DIST_L2, 5)
+    yy, xx = np.ogrid[: base.shape[0], : base.shape[1]]
+    prompt_radius = max(12.0, min(64.0, min(base.shape) * 0.18))
+    prompt_neighbourhood = (xx - x) ** 2 + (yy - y) ** 2 <= prompt_radius**2
+    supported &= (base >= 0.02) | (distance <= growth_limit) | prompt_neighbourhood
+    enclosed, enclosed_labels = _enclosed_background_components(base)
+    # Nếu click trực tiếp vào lỗ bị xóa nhầm thì chỉ mở đúng component lỗ đó.
+    protected_holes = enclosed.copy()
+    if enclosed[y, x]:
+        protected_holes &= enclosed_labels != enclosed_labels[y, x]
+    supported &= ~protected_holes
+    filtered = np.where(supported, detail, 0.0).astype(np.float32)
+    fused = np.maximum(base, filtered)
+    weight = (
+        np.minimum(_hann_weight(base.shape[0], base.shape[1]), 1.0)
+        if blend_weight is None
+        else np.clip(blend_weight, 0.0, 1.0)
+    )
+    return (base + (fused - base) * weight).astype(np.float32)
+
+
+def _enclosed_background_mask(base: np.ndarray) -> np.ndarray:
+    """Tìm background component kín không nối ra mép tile."""
+    return _enclosed_background_components(base)[0]
+
+
+def _enclosed_background_components(base: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Trả mask và nhãn component background kín để bảo vệ theo từng lỗ."""
+    if cv2 is None:
+        return np.zeros(base.shape, dtype=bool), np.zeros(base.shape, dtype=np.int32)
+    background = (base < 0.02).astype(np.uint8)
+    count, labels = cv2.connectedComponents(background, connectivity=8)
+    if count <= 1:
+        return np.zeros(base.shape, dtype=bool), labels
+    border_labels = np.unique(
+        np.concatenate((labels[0, :], labels[-1, :], labels[:, 0], labels[:, -1]))
+    )
+    return (labels > 0) & ~np.isin(labels, border_labels), labels
 
 
 class LocalModelRuntime:
@@ -210,6 +433,9 @@ class LocalModelRuntime:
             candidates,
             key=lambda model: (int(model.get("priority", 0)), str(model.get("model_id", ""))),
         )
+
+    def has_role(self, role: str) -> bool:
+        return self._ready(role) is not None
 
     @staticmethod
     def _providers(manifest: dict[str, Any]) -> list[str]:
@@ -338,7 +564,10 @@ class LocalModelRuntime:
             raise ValueError(f"Output SR phải là ảnh RGB/RGBA, nhận {array.shape}")
         array = array[:, :, :3]
         output_range = str(manifest.get("output_range", "zero_one")).lower()
-        if output_range in {"minus_one_one", "-1_1"}:
+        if output_range in {"byte_0_255", "0_255", "uint8"}:
+            # Một số ONNX inpainting trả RGB 0..255 thay vì tensor chuẩn hóa 0..1.
+            array = array / 255.0
+        elif output_range in {"minus_one_one", "-1_1"}:
             array = (array + 1.0) * 0.5
         elif output_range not in {"zero_one", "0_1"}:
             raise ValueError(f"output_range SR không hỗ trợ: {output_range}")
@@ -429,10 +658,73 @@ class LocalModelRuntime:
                 "latency_ms": round((time.perf_counter() - started) * 1000.0, 3),
             }
 
+    def inpaint_rgb(
+        self,
+        rgb: np.ndarray,
+        mask: np.ndarray,
+        role: str = "watermark_inpaint_fast",
+        context: dict[str, Any] | None = None,
+    ) -> tuple[np.ndarray | None, dict[str, Any]]:
+        """Chạy ONNX inpainting bằng image+mask; thiếu pack thì fallback ở router."""
+        started = time.perf_counter()
+        manifest = self._ready(role)
+        if manifest is None:
+            return None, {"status": "model_not_installed", "role": role}
+        providers = self._providers(manifest)
+        if ort is None or not providers:
+            return None, {"status": "runtime_or_qualified_backend_unavailable", "role": role}
+        try:
+            adapter = str(manifest.get("adapter", "")).lower()
+            if adapter not in {"lama-v1", "lama", "generic-inpaint", "onnx-inpaint"}:
+                return None, {"status": "unsupported_inpaint_adapter", "adapter": adapter, "role": role}
+            session = self._session(manifest)
+            model_inputs = list(session.get_inputs())
+            if len(model_inputs) < 2:
+                return None, {"status": "missing_mask_input", "role": role}
+            image_name = self._input_name(manifest, model_inputs, "image_input_name", index=0)
+            input_size = _input_size(manifest, (1024, 1024))
+            image_tensor, layout = self._image_input(rgb, manifest, model_inputs[0], input_size)
+            mask_index = 1 if len(model_inputs) > 1 else 0
+            mask_name = self._input_name(manifest, model_inputs, "mask_input_name", index=mask_index)
+            mask_values = _resize_float(np.clip(mask.astype(np.float32), 0.0, 1.0), input_size)
+            mask_layout = str(manifest.get("mask_input_layout", layout)).upper()
+            mask_tensor = _tensor(mask_values, mask_layout)
+            outputs = session.run(
+                [str(manifest["output_name"])] if manifest.get("output_name") else None,
+                {image_name: image_tensor, mask_name: mask_tensor},
+            )
+            output_index = int(manifest.get("output_index", 0))
+            if output_index < 0 or output_index >= len(outputs):
+                raise ValueError(f"Output index inpaint không hợp lệ: {output_index}")
+            output = self._image_output(outputs[output_index], manifest)
+            if output.shape[:2] != rgb.shape[:2]:
+                output = _resize_rgb(output, (rgb.shape[1], rgb.shape[0]))
+            return output, {
+                "status": "ok",
+                "role": role,
+                "model_id": manifest.get("model_id"),
+                "revision": manifest.get("revision"),
+                "adapter": adapter,
+                "backend": session.get_providers()[0],
+                "runtime_ready": bool(manifest.get("runtime_ready", manifest.get("installed", True))),
+                "quality_qualified": bool(manifest.get("quality_qualified", False)),
+                "input_size": list(input_size),
+                "context": context or {},
+                "latency_ms": round((time.perf_counter() - started) * 1000.0, 3),
+            }
+        except Exception as error:
+            return None, {
+                "status": "inference_failed",
+                "role": role,
+                "error": f"{type(error).__name__}: {error}",
+                "latency_ms": round((time.perf_counter() - started) * 1000.0, 3),
+            }
+
     def semantic_proposal(
         self,
         rgb: np.ndarray,
         foreground_points: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None,
+        auto_detail: bool = False,
     ) -> tuple[np.ndarray | None, dict[str, Any]]:
         started = time.perf_counter()
         manifest = self._ready("base_alpha_proposal")
@@ -460,34 +752,84 @@ class LocalModelRuntime:
                 return _resize_float(mask, (source.shape[1], source.shape[0]))
 
             proposal = infer(rgb).copy()
-            focus_tiles: list[tuple[int, int, int, int]] = []
+            prompt_focus_tiles: list[
+                tuple[tuple[int, int, int, int], tuple[float, float]]
+            ] = []
             points = _prompt_points(foreground_points, rgb.shape[1], rgb.shape[0])
-            # Lite 512 chỉ chạy tile khi có click, tránh tăng thời gian và false positive vô cớ.
+            max_focus_tiles = max(1, min(6, int(manifest.get("max_focus_tiles", 4))))
+            # Click vẫn được ưu tiên cho chi tiết người dùng chỉ định.
             if points and max(input_size) <= 512 and max(rgb.shape[:2]) > max(input_size):
                 for point in points:
                     for vertical_bias in (0.0, -0.18):
                         bounds = _focus_tile_bounds(
                             rgb.shape[1], rgb.shape[0], point, input_size, vertical_bias
                         )
-                        if bounds in focus_tiles:
+                        spec = (bounds, point)
+                        if spec in prompt_focus_tiles:
                             continue
-                        focus_tiles.append(bounds)
-                        if len(focus_tiles) >= 3:
+                        prompt_focus_tiles.append(spec)
+                        if len(prompt_focus_tiles) >= min(3, max_focus_tiles):
                             break
-                    if len(focus_tiles) >= 3:
+                    if len(prompt_focus_tiles) >= min(3, max_focus_tiles):
                         break
-                for x0, y0, x1, y1 in focus_tiles:
+            auto_focus_tiles: list[
+                tuple[tuple[int, int, int, int], tuple[float, float]]
+            ] = []
+            if auto_detail and max(input_size) <= 512 and max(rgb.shape[:2]) > max(input_size):
+                auto_focus_tiles = _auto_detail_tile_specs(
+                    proposal,
+                    input_size,
+                    max_tiles=max(0, max_focus_tiles - len(prompt_focus_tiles)),
+                )
+                prompt_bounds = {spec[0] for spec in prompt_focus_tiles}
+                auto_focus_tiles = [
+                    spec for spec in auto_focus_tiles if spec[0] not in prompt_bounds
+                ]
+            focus_tiles = prompt_focus_tiles + auto_focus_tiles
+            detail_cache: dict[tuple[int, int, int, int], np.ndarray] = {}
+            for bounds, point in prompt_focus_tiles:
+                x0, y0, x1, y1 = bounds
+                detail = detail_cache.get(bounds)
+                if detail is None:
                     detail = infer(rgb[y0:y1, x0:x1])
-                    proposal[y0:y1, x0:x1] = np.maximum(proposal[y0:y1, x0:x1], detail)
+                    detail_cache[bounds] = detail
+                base_view = proposal[y0:y1, x0:x1]
+                local_point = (point[0] - x0, point[1] - y0)
+                blend_weight = _detail_tile_weight(
+                    y1 - y0,
+                    x1 - x0,
+                    (x0 == 0, y0 == 0, x1 == rgb.shape[1], y1 == rgb.shape[0]),
+                )
+                proposal[y0:y1, x0:x1] = _merge_prompted_detail(
+                    base_view, detail, local_point, blend_weight
+                )
+            for bounds, parent_seed in auto_focus_tiles:
+                x0, y0, x1, y1 = bounds
+                detail = infer(rgb[y0:y1, x0:x1])
+                base_view = proposal[y0:y1, x0:x1]
+                local_seed = (parent_seed[0] - x0, parent_seed[1] - y0)
+                blend_weight = _detail_tile_weight(
+                    y1 - y0,
+                    x1 - x0,
+                    (x0 == 0, y0 == 0, x1 == rgb.shape[1], y1 == rgb.shape[0]),
+                )
+                proposal[y0:y1, x0:x1] = _merge_supported_detail(
+                    base_view, detail, local_seed, blend_weight
+                )
             return proposal, {
                 "status": "ok",
                 "model_id": manifest.get("model_id"),
                 "revision": manifest.get("revision"),
                 "adapter": adapter,
                 "backend": session.get_providers()[0],
+                "runtime_ready": bool(manifest.get("runtime_ready", manifest.get("installed", True))),
+                "quality_qualified": bool(manifest.get("quality_qualified", False)),
                 "input_size": list(input_size),
                 "letterboxed": True,
                 "focus_tile_count": len(focus_tiles),
+                "prompt_focus_tile_count": len(prompt_focus_tiles),
+                "auto_focus_tile_count": len(auto_focus_tiles),
+                "auto_detail": bool(auto_detail),
                 "latency_ms": round((time.perf_counter() - started) * 1000.0, 3),
             }
         except Exception as error:
@@ -572,6 +914,8 @@ class LocalModelRuntime:
                 "revision": manifest.get("revision"),
                 "adapter": adapter,
                 "backend": session.get_providers()[0],
+                "runtime_ready": bool(manifest.get("runtime_ready", manifest.get("installed", True))),
+                "quality_qualified": bool(manifest.get("quality_qualified", False)),
                 "membership_only": True,
                 "prompt_count": len(foreground) + len(background),
                 "latency_ms": round((time.perf_counter() - started) * 1000.0, 3),
@@ -641,7 +985,13 @@ class LocalModelRuntime:
         unknown = unknown_mask
         ys, xs = np.nonzero(unknown)
         if not xs.size:
-            return alpha, {"status": "no_unknown_roi"}
+            return alpha, {
+                "status": "no_unknown_roi",
+                "model_id": manifest.get("model_id"),
+                "revision": manifest.get("revision"),
+                "runtime_ready": bool(manifest.get("runtime_ready", manifest.get("installed", True))),
+                "quality_qualified": bool(manifest.get("quality_qualified", False)),
+            }
         margin = 32
         x0, x1 = max(0, int(xs.min()) - margin), min(rgb.shape[1], int(xs.max()) + margin + 1)
         y0, y1 = max(0, int(ys.min()) - margin), min(rgb.shape[0], int(ys.max()) + margin + 1)
@@ -727,6 +1077,8 @@ class LocalModelRuntime:
                 "revision": manifest.get("revision"),
                 "adapter": adapter,
                 "backend": session.get_providers()[0],
+                "runtime_ready": bool(manifest.get("runtime_ready", manifest.get("installed", True))),
+                "quality_qualified": bool(manifest.get("quality_qualified", False)),
                 "roi": [x0, y0, x1, y1],
                 "tile_count": tile_count,
                 "tile_size": [tile_width, tile_height],

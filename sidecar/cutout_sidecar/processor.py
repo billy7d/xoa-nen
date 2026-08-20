@@ -420,13 +420,18 @@ def _nearest_candidate_pixel(
         return None
     distance = np.square(local_x + x0 - x) + np.square(local_y + y0 - y)
     index = int(np.argmin(distance))
+    if int(distance[index]) > radius**2:
+        return None
     return int(local_x[index] + x0), int(local_y[index] + y0)
 
 
-def _components_from_prompts(candidate: np.ndarray, points: list[tuple[int, int]]) -> tuple[np.ndarray, int]:
+def _components_from_prompts(
+    candidate: np.ndarray,
+    points: list[tuple[int, int]],
+) -> tuple[np.ndarray, int, int]:
     """Giữ các component có prompt; Shift-click có thể bổ sung component rời."""
     if not points:
-        return candidate.copy(), 0
+        return candidate.copy(), 0, 0
     selected = np.zeros(candidate.shape, dtype=bool)
     seeds = [
         seed
@@ -434,23 +439,25 @@ def _components_from_prompts(candidate: np.ndarray, points: list[tuple[int, int]
         if (seed := _nearest_candidate_pixel(candidate, point)) is not None
     ]
     if not seeds:
-        return candidate.copy(), 0
+        return candidate.copy(), 0, 0
     if cv2 is not None:
         count, labels = cv2.connectedComponents(candidate.astype(np.uint8), connectivity=8)
         selected_labels = {int(labels[y, x]) for x, y in seeds if int(labels[y, x]) > 0}
         if selected_labels:
             selected = np.isin(labels, list(selected_labels))
-            return selected, len(selected_labels)
-        return candidate.copy(), 0
+            return selected, len(selected_labels), len(seeds)
+        return candidate.copy(), 0, len(seeds)
     for seed in seeds:
         selected |= flood_connected(candidate, [seed])
-    return selected, len(seeds)
+    return selected, len(seeds), len(seeds)
 
 
 def conservative_object_masks(
     semantic_alpha: np.ndarray,
     foreground_points: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None,
     background_points: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None,
+    selection_points: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None,
+    restrict_to_prompted_components: bool = True,
 ) -> dict[str, Any]:
     """Tách candidate bảo toàn vật thể khỏi dải unknown hẹp dành cho matte."""
     semantic = np.clip(np.asarray(semantic_alpha, dtype=np.float32), 0.0, 1.0)
@@ -459,30 +466,54 @@ def conservative_object_masks(
     height, width = semantic.shape
     foreground = _prompt_points(foreground_points, width, height)
     background = _prompt_points(background_points, width, height)
+    selection = (
+        _prompt_points(selection_points, width, height) if selection_points is not None else None
+    )
     foreground_seed = _prompt_disk((height, width), foreground, radius=4)
     background_seed = _prompt_disk((height, width), background, radius=4)
 
     # Ngưỡng thấp tạo possible foreground có recall cao; không dùng nó để xoá.
-    candidate = semantic >= 0.05
+    candidate_threshold = 0.05
+    candidate = semantic >= candidate_threshold
     silhouette = semantic >= 0.50
     candidate[background_seed] = False
     silhouette[background_seed] = False
-    selected_components, selected_component_count = _components_from_prompts(candidate, foreground)
-    if foreground and selected_component_count:
-        candidate &= selected_components
-        silhouette &= selected_components
+    component_points = selection if selection is not None else foreground
+    selected_components, selected_component_count, mapped_selection_point_count = _components_from_prompts(
+        candidate, component_points
+    )
+    selection_mapping_complete = mapped_selection_point_count == len(component_points)
+    if restrict_to_prompted_components:
+        if selection is not None and not selection:
+            candidate[:] = False
+            silhouette[:] = False
+        elif component_points and selected_component_count and selection_mapping_complete:
+            candidate &= selected_components
+            silhouette &= selected_components
+    _, protected_component_count, mapped_protection_point_count = _components_from_prompts(
+        candidate, foreground
+    )
+    effective_foreground_seed = foreground_seed.copy()
+    if restrict_to_prompted_components and selection is not None:
+        if not selection:
+            effective_foreground_seed[:] = False
+        elif selected_component_count and selection_mapping_complete:
+            selection_support = _morph_mask(selected_components, "dilate", radius=28)
+            effective_foreground_seed &= selection_support
     # Điểm khoá vẫn là foreground cứng cả khi model bỏ sót đúng pixel click.
-    candidate |= foreground_seed
-    silhouette |= foreground_seed
+    candidate |= effective_foreground_seed
+    silhouette |= effective_foreground_seed
+    foreground_seed = effective_foreground_seed
 
-    # Core chắc chắn không bao giờ được ViTMatte hoặc graph-cut ghi thành nền.
-    sure_foreground = _morph_mask(silhouette, "erode", radius=2)
-    sure_foreground |= (semantic >= 0.92) & candidate
+    # Dải trimap phải tăng theo độ phân giải. Ngưỡng semantic cao chỉ là độ tin cậy
+    # membership, không phải opacity; không khóa nhựa trong/ống hút thành alpha=1.
+    trimap_radius = max(2, min(24, round(max(height, width) * 4.0 / 512.0)))
+    sure_foreground = _morph_mask(silhouette, "erode", radius=trimap_radius)
     sure_foreground |= foreground_seed
     sure_foreground &= ~background_seed
 
-    # Dải matte chỉ rộng vài pixel quanh silhouette/possible foreground.
-    candidate_neighbourhood = _morph_mask(candidate, "dilate", radius=4)
+    # Cho ViTMatte nhìn đủ hai phía của biên thay vì dải cố định 4 px ở mọi độ phân giải.
+    candidate_neighbourhood = _morph_mask(candidate, "dilate", radius=trimap_radius)
     sure_background = ~candidate_neighbourhood
     sure_background |= background_seed
     sure_background &= ~sure_foreground
@@ -495,6 +526,14 @@ def conservative_object_masks(
         "foreground_seed": foreground_seed,
         "background_seed": background_seed,
         "selected_component_count": selected_component_count,
+        "protected_component_count": protected_component_count,
+        "mapped_selection_point_count": mapped_selection_point_count,
+        "mapped_protection_point_count": mapped_protection_point_count,
+        "selection_mapping_complete": selection_mapping_complete,
+        "component_point_count": len(component_points),
+        "selection_point_count": len(selection or []),
+        "candidate_threshold": candidate_threshold,
+        "trimap_radius": trimap_radius,
     }
 
 
@@ -824,8 +863,11 @@ def artwork_alpha(
     semantic_alpha: np.ndarray | None = None,
     foreground_points: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None,
     background_points: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None,
+    selection_points: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None,
     protection_mode: str = "CONSERVATIVE",
     shadow_policy: str = "REMOVE",
+    subject_policy: str = "ALL_DETECTED",
+    source_alpha_mode: str = "PRESERVE",
     return_guidance: bool = False,
 ) -> tuple[np.ndarray, dict[str, Any]] | tuple[np.ndarray, dict[str, Any], dict[str, Any] | None]:
     started = time.perf_counter()
@@ -835,6 +877,8 @@ def artwork_alpha(
     engine_profile = str(engine_profile).upper()
     protection_mode = str(protection_mode).upper()
     shadow_policy = str(shadow_policy).upper()
+    subject_policy = str(subject_policy).upper()
+    source_alpha_mode = str(source_alpha_mode).upper()
     if quality_preset not in {"FAST", "QUALITY"}:
         raise ValueError(f"Quality preset không hợp lệ: {quality_preset}")
     if engine_profile not in {"LEGACY_V1", "V3_BALANCED", "V3_AI_LOCAL"}:
@@ -844,6 +888,10 @@ def artwork_alpha(
         raise ValueError(f"Protection mode không hợp lệ: {protection_mode}")
     if shadow_policy != "REMOVE":
         raise ValueError(f"Shadow policy không hợp lệ: {shadow_policy}")
+    if subject_policy not in {"ALL_DETECTED", "SELECTED"}:
+        raise ValueError(f"Subject policy không hợp lệ: {subject_policy}")
+    if source_alpha_mode not in {"PRESERVE", "RECOVER_PRIOR_CUTOUT"}:
+        raise ValueError(f"Source alpha mode không hợp lệ: {source_alpha_mode}")
 
     legacy_alpha, legacy_diagnostics = legacy_artwork_alpha(
         rgb, source_alpha, tolerance=tolerance, softness=softness
@@ -883,6 +931,8 @@ def artwork_alpha(
             semantic_native,
             foreground_points=foreground_points,
             background_points=background_points,
+            selection_points=selection_points,
+            restrict_to_prompted_components=subject_policy == "SELECTED",
         )
 
     proxy_edge = 104 if quality_preset == "FAST" else 192
@@ -957,10 +1007,13 @@ def artwork_alpha(
         object_candidate = guidance["object_candidate"]
         sure_foreground = guidance["sure_foreground"]
         sure_background = guidance["sure_background"]
-        # Candidate AI độc lập thay thế alpha cũ trong silhouette để không giữ lỗ đã bị xoá.
+        # Mặc định không hồi sinh hidden RGB của PNG RGBA. Chỉ profile phục hồi
+        # cutout cũ do người dùng chọn mới được nới trần alpha trong candidate AI.
         source_alpha_ceiling = source_alpha.astype(np.float32, copy=True)
-        recovered_source_alpha = object_candidate & (source_alpha_ceiling < 0.98)
-        source_alpha_ceiling[object_candidate] = 1.0
+        recovered_source_alpha = np.zeros_like(object_candidate, dtype=bool)
+        if source_alpha_mode == "RECOVER_PRIOR_CUTOUT":
+            recovered_source_alpha = object_candidate & (source_alpha_ceiling < 0.98)
+            source_alpha_ceiling[object_candidate] = 1.0
         guidance["source_alpha_ceiling"] = source_alpha_ceiling
         semantic_proxy = _resize_float(
             semantic_native,
@@ -968,7 +1021,28 @@ def artwork_alpha(
             Image.Resampling.BILINEAR,
         )
         semantic_graph_disagreement = (semantic_proxy >= 0.50) != graph_foreground
-        disagreement_fraction = float(np.mean(semantic_graph_disagreement))
+        selection_mapping_failed = bool(
+            subject_policy == "SELECTED"
+            and int(guidance.get("mapped_selection_point_count", 0))
+            < int(guidance.get("component_point_count", 0))
+        )
+        disagreement_scope = np.ones(semantic_graph_disagreement.shape, dtype=bool)
+        if (
+            subject_policy == "SELECTED"
+            and not selection_mapping_failed
+            and int(guidance.get("selected_component_count", 0)) > 0
+        ):
+            disagreement_scope = _resize_mask(
+                object_candidate,
+                (proxy_rgb.shape[1], proxy_rgb.shape[0]),
+                Image.Resampling.NEAREST,
+            )
+            semantic_graph_disagreement &= disagreement_scope
+        disagreement_fraction = (
+            float(np.mean(semantic_graph_disagreement[disagreement_scope]))
+            if np.any(disagreement_scope)
+            else 0.0
+        )
         alpha = np.where(object_candidate, semantic_native, 0.0).astype(np.float32)
         alpha[sure_background] = 0.0
         alpha[sure_foreground] = 1.0
@@ -988,7 +1062,24 @@ def artwork_alpha(
                 round(y1 * rgb.shape[0] / proxy_rgb.shape[0]),
             ]
             review_regions.append(region)
-        needs_protection = bool(not foreground_native and disagreement_fraction > 0.08)
+        # Một click trong ALL_DETECTED chỉ bảo vệ component được click, không được làm im
+        # cảnh báo của các vật thể khác. SELECTED mới có scope khép kín để suppress review.
+        selected_scope_protected = bool(
+            foreground_native
+            and subject_policy == "SELECTED"
+            and not selection_mapping_failed
+            and int(guidance.get("selected_component_count", 0)) > 0
+            and int(guidance.get("protected_component_count", 0))
+            >= int(guidance.get("selected_component_count", 0))
+        )
+        needs_review = bool(
+            selection_mapping_failed
+            or (not selected_scope_protected and disagreement_fraction > 0.05)
+        )
+        needs_protection = bool(
+            selection_mapping_failed
+            or (not selected_scope_protected and disagreement_fraction > 0.08)
+        )
         diagnostics = {
             "engine": "hybrid-cutout-v3",
             "engine_profile": engine_profile,
@@ -1004,7 +1095,14 @@ def artwork_alpha(
             "graphcut_status": graph_status,
             "protection_mode": protection_mode,
             "shadow_policy": shadow_policy,
+            "subject_policy": subject_policy,
+            "source_alpha_mode": source_alpha_mode,
             "protection_activated": bool(foreground_native),
+            "selected_scope_protected": selected_scope_protected,
+            "selection_mapping_failed": selection_mapping_failed,
+            "disagreement_scope": "selected" if subject_policy == "SELECTED" else "all_detected",
+            "selected_component_count": int(guidance.get("selected_component_count", 0)),
+            "protected_component_count": int(guidance.get("protected_component_count", 0)),
             "result_status": "NEEDS_PROTECTION" if needs_protection else "READY",
             "candidate_scores": {
                 "legacy_background_fraction": round(float(np.mean(legacy_background)), 6),
@@ -1016,15 +1114,17 @@ def artwork_alpha(
                 "sure_foreground_fraction": round(float(np.mean(sure_foreground)), 6),
                 "source_alpha_recovery_fraction": round(float(np.mean(recovered_source_alpha)), 6),
                 "palette_high_coverage": round(float(np.mean(spatial_distance <= high)), 6),
+                "semantic_candidate_threshold": float(guidance["candidate_threshold"]),
+                "trimap_radius_px": int(guidance["trimap_radius"]),
             },
-            "needs_review": needs_protection,
+            "needs_review": needs_review,
             "needs_protection": needs_protection,
-            "review_regions": review_regions if needs_protection else [],
+            "review_regions": review_regions if needs_review else [],
             "ai_models_used": [],
             "native_unknown_refinement": False,
             "source_alpha_contract": (
                 "conservative_restore_inside_candidate"
-                if np.any(recovered_source_alpha)
+                if source_alpha_mode == "RECOVER_PRIOR_CUTOUT" and np.any(recovered_source_alpha)
                 else "multiply"
             ),
             "stage_timings_ms": stage_timings,
@@ -1297,6 +1397,10 @@ def analyze_components(alpha: np.ndarray, max_edge: int = 512) -> list[dict[str,
                     round(min_y * height / proxy_h),
                     round((max_x + 1) * width / proxy_w),
                     round((max_y + 1) * height / proxy_h),
+                ],
+                "seed_point": [
+                    round((start_x + 0.5) * width / proxy_w, 3),
+                    round((start_y + 0.5) * height / proxy_h, 3),
                 ],
                 "needs_review": native_area < 64,
             }

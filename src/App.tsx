@@ -13,11 +13,16 @@ import type {
   PreflightReport,
   ProjectPayload,
   QualityPreset,
+  SourceAlphaMode,
   ToolMode,
   UpscaleMode,
   UpscaleScale,
   WandAlgorithm,
   WandPreview,
+  WatermarkBrushMode,
+  WatermarkExpand,
+  WatermarkQuality,
+  WatermarkSession,
 } from "./types";
 
 const tools: Array<{ id: ToolMode; label: string; key: string; icon: string }> = [
@@ -43,6 +48,7 @@ export default function App() {
   const [foregroundPoints, setForegroundPoints] = useState<ForegroundPoint[]>([]);
   const [engineProfile, setEngineProfile] = useState<EngineProfile>("V3_BALANCED");
   const [quality, setQuality] = useState<QualityPreset>("QUALITY");
+  const [sourceAlphaMode, setSourceAlphaMode] = useState<SourceAlphaMode>("PRESERVE");
   const [legacyTolerance, setLegacyTolerance] = useState(30);
   const [legacySoftness, setLegacySoftness] = useState(18);
   const [autoTolerance, setAutoTolerance] = useState(30);
@@ -51,6 +57,13 @@ export default function App() {
   const [wandSoftness, setWandSoftness] = useState(18);
   const [wandAlgorithm, setWandAlgorithm] = useState<WandAlgorithm>("SMART");
   const [wandPreview, setWandPreview] = useState<WandPreview | null>(null);
+  const [watermarkSession, setWatermarkSession] = useState<WatermarkSession | null>(null);
+  const [watermarkQuality, setWatermarkQuality] = useState<WatermarkQuality>("BALANCED");
+  const [watermarkBrushMode, setWatermarkBrushMode] = useState<WatermarkBrushMode>("ADD");
+  const [watermarkMaskVisible, setWatermarkMaskVisible] = useState(true);
+  const [watermarkFeather, setWatermarkFeather] = useState(8);
+  const [watermarkExpand, setWatermarkExpand] = useState<WatermarkExpand>("MEDIUM");
+  const [watermarkView, setWatermarkView] = useState<"ORIGINAL" | "MASK" | "RESULT">("MASK");
   const [radius, setRadius] = useState(20);
   const [hardness, setHardness] = useState(82);
   const [contiguous, setContiguous] = useState(true);
@@ -110,6 +123,7 @@ export default function App() {
 
   useEffect(() => {
     setForegroundPoints(project?.process?.foreground_points ?? []);
+    setSourceAlphaMode(project?.process?.source_alpha_mode ?? "PRESERVE");
   }, [project?.project_id, project?.revision]);
 
   useEffect(() => {
@@ -143,6 +157,20 @@ export default function App() {
           return;
         }
       }
+      if (watermarkSession && !busy && !event.repeat && !event.isComposing) {
+        if (event.key === "Enter" && watermarkSession.status === "READY") {
+          event.preventDefault();
+          event.stopPropagation();
+          void applyWatermarkSession();
+          return;
+        }
+        if (event.key === "Escape") {
+          event.preventDefault();
+          event.stopPropagation();
+          void cancelWatermarkSession();
+          return;
+        }
+      }
       if (event.target instanceof HTMLInputElement || event.target instanceof HTMLSelectElement) return;
       const mapping: Record<string, ToolMode> = {
         h: "pan", o: "subject", p: "protect", k: "keep", e: "remove", w: "wand-keep", s: "wand-remove", m: "watermark",
@@ -168,6 +196,7 @@ export default function App() {
     if (imported) {
       setProject(imported);
       setWandPreview(null);
+      setWatermarkSession(null);
       setPreflight(null);
       setTool("pan");
       setForegroundPoints([]);
@@ -183,7 +212,8 @@ export default function App() {
       softness: legacy ? legacySoftness : autoSoftness,
       quality_preset: quality,
       engine_profile: engineProfile,
-      subject_policy: "ALL_DETECTED",
+      subject_policy: project.process?.subject_policy ?? "ALL_DETECTED",
+      source_alpha_mode: sourceAlphaMode,
       foreground_points: foregroundPoints,
       background_points: [],
       protection_mode: "CONSERVATIVE",
@@ -192,6 +222,7 @@ export default function App() {
     if (processed) {
       setProject(processed);
       setWandPreview(null);
+      setWatermarkSession(null);
       setPreflight(null);
       setTool(processed.process?.result_status === "NEEDS_PROTECTION"
         ? "protect"
@@ -220,12 +251,99 @@ export default function App() {
     if (edited) { setProject(edited); setPreflight(null); }
   };
 
-  const removeWatermark = async (mode: "AUTO" | "MANUAL", points: Array<{ x: number; y: number }> = []) => {
-    if (!project) return;
-    const edited = await run(mode === "AUTO" ? "Đang tìm và xóa watermark" : "Đang lấp vùng watermark", () => coordinatorCall<ProjectPayload>("remove_watermark", {
-      project_id: project.project_id, mode, points, radius,
+  const beginWatermarkSession = async (): Promise<WatermarkSession | null> => {
+    if (!project) return null;
+    if (watermarkSession?.project_id === project.project_id) return watermarkSession;
+    const session = await run("Đang mở phiên watermark", () => coordinatorCall<WatermarkSession>("begin_watermark_session", {
+      project_id: project.project_id,
+      quality: watermarkQuality,
+      feather: watermarkFeather,
+      expand: watermarkExpand,
     }));
-    if (edited) { setProject(edited); setPreflight(null); }
+    if (session) {
+      setWatermarkSession(session);
+      setWatermarkView("MASK");
+      setTool("watermark");
+    }
+    return session;
+  };
+
+  const autoDetectWatermark = async () => {
+    if (!project) return;
+    const current = watermarkSession ?? await beginWatermarkSession();
+    if (!current) return;
+    const session = await run("Đang phân tích watermark", () => coordinatorCall<WatermarkSession>("auto_detect_watermark", {
+      project_id: project.project_id,
+      session_id: current.session_id,
+      feather: watermarkFeather,
+      expand: watermarkExpand,
+    }));
+    if (session) {
+      setWatermarkSession(session);
+      setWatermarkMaskVisible(true);
+      setWatermarkView("MASK");
+      setTool("watermark");
+      await previewWatermarkSession(session);
+    }
+  };
+
+  const updateWatermarkMask = async (points: Array<{ x: number; y: number }>) => {
+    if (!project || !points.length) return;
+    const current = watermarkSession ?? await beginWatermarkSession();
+    if (!current) return;
+    const session = await run(watermarkBrushMode === "ADD" ? "Đang thêm mask watermark" : "Đang trừ mask watermark", () => coordinatorCall<WatermarkSession>("update_watermark_mask", {
+      project_id: project.project_id,
+      session_id: current.session_id,
+      mode: watermarkBrushMode,
+      points,
+      radius,
+      hardness: hardness / 100,
+      feather: watermarkFeather,
+    }));
+    if (session) {
+      setWatermarkSession(session);
+      setWatermarkMaskVisible(true);
+      setWatermarkView("MASK");
+    }
+  };
+
+  const previewWatermarkSession = async (candidate = watermarkSession) => {
+    if (!project || !candidate) return;
+    const preview = await run("Đang tạo preview phục hồi watermark", () => coordinatorCall<WatermarkSession>("preview_watermark", {
+      project_id: project.project_id,
+      session_id: candidate.session_id,
+      quality: watermarkQuality,
+    }));
+    if (preview) {
+      // Chỉ chuyển canvas sang kết quả sau khi backend đã tạo xong ảnh preview không phá hủy.
+      setWatermarkSession(preview);
+      setWatermarkMaskVisible(false);
+      setWatermarkView("RESULT");
+    }
+  };
+
+  const applyWatermarkSession = async () => {
+    if (!project || !watermarkSession || watermarkSession.status !== "READY") return;
+    const edited = await run("Đang áp dụng preview watermark", () => coordinatorCall<ProjectPayload>("commit_watermark", {
+      project_id: project.project_id,
+      session_id: watermarkSession.session_id,
+    }));
+    if (edited) {
+      setProject(edited);
+      setWatermarkSession(null);
+      setPreflight(null);
+    }
+  };
+
+  const cancelWatermarkSession = async (showBusy = true) => {
+    if (!project || !watermarkSession) return;
+    const operation = () => coordinatorCall<{ cancelled: boolean }>("cancel_watermark", {
+      project_id: project.project_id,
+      session_id: watermarkSession.session_id,
+    });
+    if (showBusy) await run("Đang hủy phiên watermark", operation); else await operation().catch(() => undefined);
+    setWatermarkSession(null);
+    setWatermarkView("MASK");
   };
 
   const previewWand = async (point: { x: number; y: number }) => {
@@ -289,12 +407,12 @@ export default function App() {
   const undo = async () => {
     if (!project || !project.history.can_undo || busy) return;
     const result = await run("Undo", () => coordinatorCall<ProjectPayload>("undo", { project_id: project.project_id }));
-    if (result) { setProject(result); setWandPreview(null); }
+    if (result) { setProject(result); setWandPreview(null); setWatermarkSession(null); }
   };
   const redo = async () => {
     if (!project || !project.history.can_redo || busy) return;
     const result = await run("Redo", () => coordinatorCall<ProjectPayload>("redo", { project_id: project.project_id }));
-    if (result) { setProject(result); setWandPreview(null); }
+    if (result) { setProject(result); setWandPreview(null); setWatermarkSession(null); }
   };
 
   const installModelPack = async () => {
@@ -366,6 +484,7 @@ export default function App() {
   };
 
   const installedModels = models.filter((model) => model.installed);
+  const qualifiedModels = installedModels.filter((model) => model.quality_qualified);
   const aiReady = installedModels.some((model) => model.role === "base_alpha_proposal");
   const tolerance = engineProfile === "LEGACY_V1" ? legacyTolerance : autoTolerance;
   const softness = engineProfile === "LEGACY_V1" ? legacySoftness : autoSoftness;
@@ -374,6 +493,8 @@ export default function App() {
   const stablePreviewPath = previewMode === "pod-clean" ? (project?.preview_pod_clean_path || project?.preview_path) : project?.preview_path;
   const canvasProject = project && wandPreview
     ? { ...project, preview_path: wandPreview.preview_path, revision: wandPreview.selection_id }
+    : project && watermarkSession?.preview_path && watermarkView === "RESULT"
+      ? { ...project, preview_path: watermarkSession.preview_path, revision: watermarkSession.revision }
     : project ? { ...project, preview_path: stablePreviewPath || project.preview_path } : project;
 
   return (
@@ -395,7 +516,7 @@ export default function App() {
         </aside>
 
         <section className="stage">
-          {canvasProject ? <EditorCanvas project={canvasProject} tool={tool} radius={radius} background={background} backgroundColor={backgroundColor} disabled={!!busy} foregroundPoints={foregroundPoints} onBrush={applyBrush} onWand={previewWand} onSubject={selectSubjectAt} onProtect={lockForegroundPoint} onWatermark={(points) => removeWatermark("MANUAL", points)} /> : (
+          {canvasProject ? <EditorCanvas project={canvasProject} tool={tool} radius={radius} background={background} backgroundColor={backgroundColor} disabled={!!busy} foregroundPoints={foregroundPoints} watermarkMaskPath={watermarkMaskVisible && watermarkView === "MASK" ? watermarkSession?.mask_preview_path : undefined} watermarkMaskRevision={watermarkSession?.revision} watermarkBrushMode={watermarkBrushMode} onBrush={applyBrush} onWand={previewWand} onSubject={selectSubjectAt} onProtect={lockForegroundPoint} onWatermark={updateWatermarkMask} /> : (
             <button className="empty-state" onClick={importImage}><span className="empty-art">✦</span><strong>Thả artwork vào đây</strong><span>PNG · JPEG · static WebP, tối đa bảo đảm 40 MP</span><em>Chọn ảnh</em></button>
           )}
           {busy && <div className="busy-overlay"><span className="spinner" />{busy}</div>}
@@ -405,6 +526,7 @@ export default function App() {
             <input aria-label="Màu nền tùy chọn" type="color" value={backgroundColor} onChange={(event) => { setBackgroundColor(event.target.value); setBackground("custom"); }} />
           </div>
           {wandPreview && <div className="wand-preview-bar"><span>{wandPreview.selected_pixel_count.toLocaleString()} px được chọn</span><button onClick={commitWand} title="Enter">Áp dụng ↵</button><button onClick={() => cancelWand()} title="Escape">Hủy Esc</button></div>}
+          {watermarkSession && <div className="wand-preview-bar"><span>{watermarkSession.status === "READY" ? "Preview phục hồi đã sẵn sàng" : `${watermarkSession.mask_pixel_count.toLocaleString()} px trong mask`}</span><button className={watermarkView === "ORIGINAL" ? "active" : ""} onClick={() => { setWatermarkView("ORIGINAL"); setWatermarkMaskVisible(false); }}>Gốc</button><button className={watermarkView === "MASK" ? "active" : ""} onClick={() => { setWatermarkView("MASK"); setWatermarkMaskVisible(true); }}>Mask</button><button className={watermarkView === "RESULT" ? "active" : ""} onClick={() => { setWatermarkView("RESULT"); setWatermarkMaskVisible(false); }} disabled={!watermarkSession.preview_path}>Kết quả</button><button onClick={() => previewWatermarkSession()} disabled={!watermarkSession.mask_pixel_count || !!busy}>Tạo preview</button><button onClick={applyWatermarkSession} disabled={watermarkSession.status !== "READY" || !!busy} title="Enter">Áp dụng ↵</button><button onClick={() => cancelWatermarkSession()} disabled={!!busy} title="Escape">Hủy Esc</button></div>}
           <div className="background-picker" aria-label="Nền preview">{(["checker", "white", "black", "garment", "custom"] as const).map((item) => <button key={item} className={`${item} ${background === item ? "active" : ""}`} onClick={() => setBackground(item)} title={`Nền ${item}`} />)}</div>
         </section>
 
@@ -413,10 +535,35 @@ export default function App() {
 
           {panel === "controls" && <div className="panel-content">
             <section className="control-section">
-              <div className="section-heading"><div><strong>XÓA WATERMARK</strong><small>Inpainting native — giữ nguyên kích thước pixel</small></div><span className="pill">LOCAL</span></div>
-              <button className="button primary full" onClick={() => removeWatermark("AUTO")} disabled={!project || !!busy}>Tự động tìm & xóa</button>
-              <div className="subject-actions"><button type="button" className={tool === "watermark" ? "active" : ""} onClick={() => setTool("watermark")}>Xóa bằng cọ (M)</button></div>
-              <p className="hint">Tự động chỉ chọn các nét chữ/logo nhỏ có tín hiệu watermark để tránh xóa nhầm artwork. Với watermark phức tạp, chọn Xóa bằng cọ, tô phủ toàn bộ watermark rồi thả chuột để lấp nền. Undo/Redo hoạt động cho cả hai chế độ.</p>
+              <div className="section-heading"><div><strong>XÓA WATERMARK</strong><small>Mask → Preview → Apply</small></div><span className="pill">LOCAL</span></div>
+              <label>Quality<select value={watermarkQuality} onChange={(event) => {
+                const next = event.target.value as WatermarkQuality;
+                setWatermarkQuality(next);
+                if (watermarkSession?.status === "READY") {
+                  // Đổi quality bắt buộc tạo preview mới để ảnh đã xem luôn trùng với ảnh sẽ commit.
+                  setWatermarkSession({ ...watermarkSession, status: "EDITING", preview_path: null });
+                  setWatermarkView("MASK");
+                  setWatermarkMaskVisible(true);
+                }
+              }}><option value="FAST">Fast</option><option value="BALANCED">Balanced</option><option value="MAXIMUM">Maximum</option></select></label>
+              <div className="subject-actions">
+                <button type="button" onClick={autoDetectWatermark} disabled={!project || !!busy}>Tự tìm & preview</button>
+                <button type="button" className={tool === "watermark" ? "active" : ""} onClick={() => { setTool("watermark"); void beginWatermarkSession(); }} disabled={!project || !!busy}>Brush (M)</button>
+              </div>
+              <div className="subject-actions watermark-mode-row">
+                <button type="button" className={watermarkBrushMode === "ADD" ? "active" : ""} onClick={() => setWatermarkBrushMode("ADD")} disabled={!project || !!busy}>Brush +</button>
+                <button type="button" className={watermarkBrushMode === "SUBTRACT" ? "active" : ""} onClick={() => setWatermarkBrushMode("SUBTRACT")} disabled={!project || !!busy}>Brush −</button>
+              </div>
+              <label className="range-row"><span>Feather <b>{watermarkFeather}px</b></span><input type="range" min="0" max="40" value={watermarkFeather} onChange={(event) => setWatermarkFeather(+event.target.value)} /></label>
+              <label>Smart Expand<select value={watermarkExpand} onChange={(event) => setWatermarkExpand(event.target.value as WatermarkExpand)}><option value="OFF">Off</option><option value="LOW">Low</option><option value="MEDIUM">Medium</option><option value="HIGH">High</option></select></label>
+              <label className="check-row"><input type="checkbox" checked={watermarkMaskVisible} onChange={(event) => setWatermarkMaskVisible(event.target.checked)} /><span>Show Mask</span></label>
+              {watermarkSession ? <div className="watermark-session-stats"><span>Mask<b>{watermarkSession.mask_pixel_count.toLocaleString()} px</b></span><span>Core<b>{watermarkSession.strong_pixel_count.toLocaleString()} px</b></span><span>{watermarkSession.source}</span></div> : null}
+              <div className="subject-actions">
+                <button type="button" onClick={() => previewWatermarkSession()} disabled={!project || !watermarkSession?.mask_pixel_count || !!busy}>Tạo preview</button>
+                <button type="button" className="primary-action" onClick={applyWatermarkSession} disabled={!project || watermarkSession?.status !== "READY" || !!busy}>Apply</button>
+                <button type="button" onClick={() => cancelWatermarkSession()} disabled={!watermarkSession || !!busy}>Cancel</button>
+              </div>
+              <p className="hint">RGB chỉ thay đổi sau khi preview đã được kiểm tra và bấm Apply. Sửa mask sẽ tự hủy preview cũ.</p>
               {project?.retouch?.watermark_removed ? <p className="success-note">Watermark đã được xử lý trong ảnh xuất.</p> : null}
             </section>
 
@@ -424,6 +571,7 @@ export default function App() {
               <div className="section-heading"><div><strong>HYBRID CUTOUT</strong><small>V3 mặc định · V1 luôn khả dụng</small></div><span className="pill">LOCAL</span></div>
               <label>Profile<select value={engineProfile} onChange={(event) => setEngineProfile(event.target.value as EngineProfile)}><option value="V3_BALANCED">V3 Cân bằng — mặc định</option><option value="V3_AI_LOCAL" disabled={!aiReady}>V3 AI Local {aiReady ? "" : "— cần model-pack"}</option><option value="LEGACY_V1">V1 nền phẳng — pixel-exact</option></select></label>
               <label>Tốc độ<select value={quality} onChange={(event) => setQuality(event.target.value as QualityPreset)}><option value="QUALITY">QUALITY — refine native</option><option value="FAST">FAST — proxy nhanh</option></select></label>
+              {project?.canonical.source_has_alpha ? <label>Alpha nguồn<select value={sourceAlphaMode} onChange={(event) => setSourceAlphaMode(event.target.value as SourceAlphaMode)}><option value="PRESERVE">Giữ alpha nguồn — an toàn</option><option value="RECOVER_PRIOR_CUTOUT">Phục hồi cutout cũ bị mất</option></select></label> : null}
               <label className="range-row"><span>Tolerance {engineProfile === "LEGACY_V1" ? "V1" : "V3"} <b>{tolerance}</b></span><input type="range" min="1" max="100" value={tolerance} onChange={(event) => engineProfile === "LEGACY_V1" ? setLegacyTolerance(+event.target.value) : setAutoTolerance(+event.target.value)} /></label>
               <label className="range-row"><span>Softness <b>{softness}</b></span><input type="range" min="0" max="60" value={softness} onChange={(event) => engineProfile === "LEGACY_V1" ? setLegacySoftness(+event.target.value) : setAutoSoftness(+event.target.value)} /></label>
               <button className="button primary full" onClick={processArtwork} disabled={!project || !!busy}>Xóa nền</button>
@@ -445,7 +593,7 @@ export default function App() {
 
             <section className="control-section">
               <h3>Chỉnh alpha</h3>
-              <label className="range-row"><span>Kích thước cọ <b>{radius}px</b></span><input type="range" min="1" max="240" value={radius} onChange={(event) => setRadius(+event.target.value)} /></label>
+              <label className="range-row"><span>Kích thước cọ <b>{radius}px</b></span><input type="range" min="1" max="300" value={radius} onChange={(event) => setRadius(+event.target.value)} /></label>
               <label className="range-row"><span>Hardness <b>{hardness}%</b></span><input type="range" min="0" max="100" value={hardness} onChange={(event) => setHardness(+event.target.value)} /></label>
               <label>Wand<select value={wandAlgorithm} onChange={(event) => setWandAlgorithm(event.target.value as WandAlgorithm)}><option value="SMART">Smart — field + geodesic</option><option value="LEGACY_COLOR">Legacy Color — đúng V1</option></select></label>
               <label className="range-row"><span>Wand tolerance <b>{wandTolerance}</b></span><input type="range" min="1" max="100" value={wandTolerance} onChange={(event) => setWandTolerance(+event.target.value)} /></label>
@@ -456,11 +604,11 @@ export default function App() {
             <section className="control-section compact"><h3>Component inspector</h3>{project ? <div className="stats-grid"><span>Tổng<b>{project.components?.count ?? 0}</b></span><span>Review<b>{project.components?.suspicious_count ?? 0}</b></span><span>Undo<b>{project.history.length}</b></span></div> : <p className="muted">Chưa có project.</p>}</section>
 
             <section className="control-section model-card">
-              <div className="section-heading"><h3>AI model-pack</h3><span>{installedModels.length} sẵn sàng</span></div>
-              <p>Chỉ nhận ONNX pack có chữ ký, SHA-256, license thương mại và backend đã qualification. Sau cài đặt xử lý hoàn toàn offline.</p>
+              <div className="section-heading"><h3>AI model-pack</h3><span>{installedModels.length} runtime OK · {qualifiedModels.length} quality đạt</span></div>
+              <p>Runtime OK xác nhận chữ ký, SHA-256, license và backend. Quality chỉ đạt sau benchmark matte riêng; xử lý vẫn hoàn toàn offline.</p>
               <button className="button secondary full model-import" onClick={installModelPack}>Nhập .cutout-modelpack</button>
               {models.filter((model) => !model.installed && model.download_url).map((model) => <button className="button secondary full model-import" key={model.model_id} onClick={() => downloadModel(model.model_id)}>Tải {model.model_id}</button>)}
-              {installedModels.map((model) => <div className="installed-model" key={model.model_id}><span>{model.model_id}<small>{model.revision}</small></span><button onClick={() => removeModel(model.model_id)}>Gỡ</button></div>)}
+              {installedModels.map((model) => <div className="installed-model" key={model.model_id}><span>{model.model_id}<small>{model.revision} · {model.quality_qualified ? "quality đạt" : "quality đang kiểm định"}</small></span><button onClick={() => removeModel(model.model_id)}>Gỡ</button></div>)}
               <button className="text-button" onClick={refreshModels}>Kiểm tra lại model</button>
             </section>
           </div>}

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { isTauriRuntime, localAssetUrl } from "../bridge";
-import type { ProjectPayload, ToolMode } from "../types";
+import type { ProjectPayload, ToolMode, WatermarkBrushMode } from "../types";
 import {
   clamp,
   normalizeWheelDelta,
@@ -22,6 +22,9 @@ interface Props {
   backgroundColor?: string;
   disabled?: boolean;
   foregroundPoints: Point[];
+  watermarkMaskPath?: string;
+  watermarkMaskRevision?: string;
+  watermarkBrushMode?: WatermarkBrushMode;
   onBrush: (points: Point[]) => Promise<void>;
   onWand: (point: Point) => Promise<void>;
   onSubject: (point: Point) => Promise<void>;
@@ -57,6 +60,9 @@ export default function EditorCanvas({
   backgroundColor = "#263a58",
   disabled,
   foregroundPoints,
+  watermarkMaskPath,
+  watermarkMaskRevision,
+  watermarkBrushMode = "ADD",
   onBrush,
   onWand,
   onSubject,
@@ -66,6 +72,7 @@ export default function EditorCanvas({
   const hostRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const imageRef = useRef<HTMLImageElement | null>(null);
+  const overlayRef = useRef<HTMLImageElement | null>(null);
   const transformRef = useRef<ViewTransform>({ scale: 1, originX: 0, originY: 0 });
   const drawRef = useRef<() => void>(() => undefined);
   const viewRef = useRef<NavigationView>({ zoom: 1, pan: { x: 0, y: 0 } });
@@ -155,6 +162,10 @@ export default function EditorCanvas({
 
     ctx.imageSmoothingEnabled = zoom < 6;
     ctx.drawImage(image, originX, originY, displayWidth, displayHeight);
+    const overlay = overlayRef.current;
+    if (watermarkMaskPath && overlay && overlay.complete && overlay.naturalWidth > 0) {
+      ctx.drawImage(overlay, originX, originY, displayWidth, displayHeight);
+    }
     ctx.strokeStyle = "rgba(255,255,255,.42)";
     ctx.lineWidth = 1;
     ctx.strokeRect(originX - 0.5, originY - 0.5, displayWidth + 1, displayHeight + 1);
@@ -202,12 +213,31 @@ export default function EditorCanvas({
       ctx.restore();
     }
 
+    const active = pointerRef.current;
+    if (tool === "watermark" && active?.mode === "brush" && active.points.length > 0) {
+      const previewRatio = image.naturalWidth / project.width;
+      const brushRadius = radius * previewRatio * scale;
+      ctx.save();
+      ctx.lineJoin = "round";
+      ctx.lineCap = "round";
+      ctx.strokeStyle = watermarkBrushMode === "ADD" ? "rgba(74,188,255,.78)" : "rgba(255,205,76,.82)";
+      ctx.lineWidth = Math.max(2, brushRadius * 2);
+      ctx.beginPath();
+      active.points.forEach((point, index) => {
+        const x = originX + (point.x / project.width) * displayWidth;
+        const y = originY + (point.y / project.height) * displayHeight;
+        if (index === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      });
+      ctx.stroke();
+      ctx.restore();
+    }
+
     if (cursor && (tool === "keep" || tool === "remove" || tool === "watermark")) {
       const previewRatio = image.naturalWidth / project.width;
       const brushRadius = radius * previewRatio * scale;
       ctx.beginPath();
       ctx.arc(cursor.x, cursor.y, Math.max(2, brushRadius), 0, Math.PI * 2);
-      ctx.strokeStyle = tool === "keep" ? "#56f09b" : tool === "watermark" ? "#65b8ff" : "#ff6078";
+      ctx.strokeStyle = tool === "keep" ? "#56f09b" : tool === "watermark" ? watermarkBrushMode === "ADD" ? "#65b8ff" : "#ffd05a" : "#ff6078";
       ctx.lineWidth = 1.5;
       ctx.stroke();
       ctx.beginPath();
@@ -215,7 +245,7 @@ export default function EditorCanvas({
       ctx.fillStyle = ctx.strokeStyle;
       ctx.fill();
     }
-  }, [background, backgroundColor, cursor, foregroundPoints, pan.x, pan.y, project.height, project.process, project.width, radius, tool, zoom]);
+  }, [background, backgroundColor, cursor, foregroundPoints, pan.x, pan.y, project.height, project.process, project.width, radius, tool, watermarkBrushMode, watermarkMaskPath, zoom]);
   drawRef.current = draw;
 
   useEffect(() => {
@@ -232,6 +262,28 @@ export default function EditorCanvas({
       image.onerror = null;
     };
   }, [project.preview_path, project.revision]);
+
+  useEffect(() => {
+    if (!watermarkMaskPath) {
+      overlayRef.current = null;
+      drawRef.current();
+      return;
+    }
+    const overlay = new Image();
+    overlay.onload = () => {
+      overlayRef.current = overlay;
+      drawRef.current();
+    };
+    overlay.onerror = () => {
+      overlayRef.current = null;
+      drawRef.current();
+    };
+    overlay.src = localAssetUrl(watermarkMaskPath, watermarkMaskRevision || watermarkMaskPath);
+    return () => {
+      overlay.onload = null;
+      overlay.onerror = null;
+    };
+  }, [watermarkMaskPath, watermarkMaskRevision]);
 
   useEffect(() => {
     draw();

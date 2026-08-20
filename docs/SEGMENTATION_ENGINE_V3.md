@@ -4,10 +4,10 @@
 
 - `LEGACY_V1` gọi implementation đóng băng từ Git HEAD `ed9be77`; tolerance/softness và alpha phải pixel-exact.
 - `V3_BALANCED` dùng V1 evidence, robust spatial background field, GrabCut proxy và native unknown-band refinement.
-- `V3_AI_LOCAL` chỉ nhận model-pack ONNX đã xác minh; mọi lỗi model fallback V3 Balanced và ghi `fallback_reason`.
+- `V3_AI_LOCAL` chỉ nhận model-pack ONNX đã xác minh; proposal lỗi mới fallback V3 Balanced, còn matte lỗi giữ proposal nhưng trả `AI_LOCAL_DEGRADED`/`NEEDS_PROTECTION` cùng `fallback_reason`.
 - Suy luận màu dùng sRGB copy theo ICC. Canonical RGB không bị ghi ngược.
 - `LEGACY_V1` và `V3_BALANCED` luôn là `SOURCE_ALPHA × CUTOUT_ALPHA`.
-- Với `V3_AI_LOCAL` + `CONSERVATIVE`, các lỗ alpha cũ chỉ được khôi phục bên trong `object_candidate` có bằng chứng độc lập; vùng ngoài candidate vẫn là background. Điều này tránh giữ lỗi tách nền cũ trong thân vật thể mà không hồi sinh nền.
+- `V3_AI_LOCAL` mặc định `source_alpha_mode=PRESERVE`, nên output không vượt alpha nguồn. Chỉ `RECOVER_PRIOR_CUTOUT` mới khôi phục lỗ alpha cũ bên trong `object_candidate`; chế độ này phải được chọn có chủ ý cho cutout cũ bị hỏng.
 - POD decontamination chỉ sửa RGB ở pixel có `0 < alpha < 1`; Master giữ RGB canonical.
 
 ## Các regression v2 đã loại bỏ
@@ -39,11 +39,20 @@ Chi tiết manifest và trạng thái model weights xem [MODEL_PACK_RUNTIME.md](
 ## Bảo toàn vật thể v4
 
 - `object_candidate` là proposal recall cao, tách biệt với `edge_matte`. Graph-cut chỉ là evidence/seed và không được quyền xóa candidate AI.
-- Khi dùng BiRefNet Lite 512, một foreground click sẽ chạy full-context kèm tối đa ba tile chồng lấn để giữ chi tiết mảnh. Model-pack dynamic/1024+ dùng trực tiếp `input_size` đã được ký trong manifest.
+- Khi dùng BiRefNet Lite 512, QUALITY tự chạy full-context kèm tile phần đầu từng component; foreground click vẫn được ưu tiên. Component detail phải nối với component cha, nằm trong growth cap và được feather mép tile.
 - Tool **Khóa vật thể** lưu `foreground_points`, `background_points`, `protection_mode=CONSERVATIVE` và `shadow_policy=REMOVE` vào processing manifest. Shift-click bổ sung chi tiết rời.
-- ViTMatte chỉ nhận trimap có `sure_foreground`, `sure_background` và unknown band hẹp. Pixel trong `sure_foreground` bị clamp sau inference.
+- ViTMatte chỉ nhận trimap có `sure_foreground`, `sure_background` và unknown band tăng theo độ phân giải. Semantic cao chứng minh membership chứ không tự động khóa alpha=1; pixel trong core `sure_foreground` mới bị clamp.
 - Khi proposal AI và graph-cut bất đồng lớn mà chưa có foreground click, result trả `NEEDS_PROTECTION`; UI yêu cầu khóa vật thể thay vì coi kết quả tự động là đạt.
 - SAM2 chỉ được dùng qua ONNX export đã qualification; raw checkpoint PyTorch không được nạp bởi app.
+
+## QA nhựa trong 2026-08-16
+
+- Ảnh private ba ly 1254² xác nhận RGB output cũ giống nguồn tuyệt đối; lỗi nắp nằm hoàn toàn ở alpha gần nhị phân.
+- Bản nâng cấp tăng detail proxy nắp trái từ 59,8% lên 74,5% và nắp giữa từ 69,2% lên 89,9%; moon-tip false positive giảm từ 525 xuống 0 pixel `alpha>=128`.
+- Ống giữa/phải đã chuyển từ gần đục sang alpha mean 157/165; thân/vành giữ 100% detail, lỗ quai giữ IoU 99,79–99,85%.
+- Pack 512 hiện tại và ViTMatte QUInt8 chỉ có `runtime_ready`; chưa có `quality_qualified`. Matte stage lỗi sẽ trả `AI_LOCAL_DEGRADED` thay vì báo READY.
+
+Phân tích, regression gate và nguồn dữ liệu xem [TRANSPARENT_DETAIL_QUALIFICATION.md](./TRANSPARENT_DETAIL_QUALIFICATION.md).
 
 ## QA bảo toàn vật thể 2026-08-11
 

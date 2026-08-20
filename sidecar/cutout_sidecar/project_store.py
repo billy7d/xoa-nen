@@ -16,7 +16,7 @@ from PIL import Image
 from .image_core import CanonicalImage, save_canonical_png, save_preview
 
 
-SCHEMA_VERSION = "3.0.0"
+SCHEMA_VERSION = "3.1.0"
 TILE_SIZE = 512
 
 
@@ -48,6 +48,10 @@ def _tile_name(tile_y: int, tile_x: int) -> str:
     return f"y{tile_y:05d}_x{tile_x:05d}.f32.zlib"
 
 
+def _rgb_tile_name(tile_y: int, tile_x: int) -> str:
+    return f"y{tile_y:05d}_x{tile_x:05d}.rgb8.zlib"
+
+
 def _encode_tile(tile: np.ndarray) -> bytes:
     payload = np.ascontiguousarray(tile, dtype="<f4").tobytes(order="C")
     return zlib.compress(payload, level=6)
@@ -60,6 +64,20 @@ def _decode_tile(payload: bytes, shape: tuple[int, int]) -> np.ndarray:
     if array.size != expected:
         raise ValueError(f"Tile corrupt: expected {expected} floats, got {array.size}")
     return np.ascontiguousarray(array.reshape(shape), dtype=np.float32)
+
+
+def _encode_rgb_tile(tile: np.ndarray) -> bytes:
+    payload = np.ascontiguousarray(tile, dtype=np.uint8).tobytes(order="C")
+    return zlib.compress(payload, level=6)
+
+
+def _decode_rgb_tile(payload: bytes, shape: tuple[int, int, int]) -> np.ndarray:
+    decoded = zlib.decompress(payload)
+    array = np.frombuffer(decoded, dtype=np.uint8)
+    expected = shape[0] * shape[1] * shape[2]
+    if array.size != expected:
+        raise ValueError(f"RGB tile corrupt: expected {expected} bytes, got {array.size}")
+    return np.ascontiguousarray(array.reshape(shape), dtype=np.uint8)
 
 
 class ProjectStore:
@@ -85,8 +103,10 @@ class ProjectStore:
         (project / "alpha" / "current").mkdir(parents=True)
         (project / "locks").mkdir(parents=True)
         (project / "journal" / "deltas").mkdir(parents=True)
+        (project / "journal" / "rgb-deltas").mkdir(parents=True)
         (project / "previews").mkdir(parents=True)
         (project / "retouch" / "snapshots").mkdir(parents=True)
+        (project / "retouch" / "staging").mkdir(parents=True)
         (project / "reports").mkdir(parents=True)
 
         canonical_path = project / "source" / "canonical.png"
@@ -118,6 +138,11 @@ class ProjectStore:
             "history": [],
             "history_cursor": 0,
             "journal_sequence": 0,
+            "retouch": {
+                "revision": 0,
+                "active_watermark_edits": 0,
+                "last_engine": None,
+            },
             "processing": None,
             "model_manifests": [],
             "export_settings": {},
@@ -153,6 +178,14 @@ class ProjectStore:
                 processing.setdefault("selected_subject_ids", [])
                 processing.setdefault("review_regions", [])
                 processing.setdefault("warnings", [])
+            manifest.setdefault(
+                "retouch",
+                {
+                    "revision": 0,
+                    "active_watermark_edits": 0,
+                    "last_engine": None,
+                },
+            )
             manifest["schema_version"] = SCHEMA_VERSION
             manifest["app_version"] = "0.3.0"
             atomic_write_json(manifest_path, manifest)
@@ -183,6 +216,48 @@ class ProjectStore:
         path.parent.mkdir(parents=True, exist_ok=True)
         Image.fromarray(np.ascontiguousarray(rgb, dtype=np.uint8), "RGB").save(path, format="PNG")
 
+    def _watermark_edit_count(self, manifest: dict[str, Any]) -> int:
+        cursor = int(manifest.get("history_cursor", len(manifest.get("history", []))))
+        count = 0
+        for entry in list(manifest.get("history", []))[:cursor]:
+            operation = entry.get("operation") or {}
+            tool = str(operation.get("tool", ""))
+            if tool.startswith("watermark"):
+                count += 1
+        return count
+
+    def _refresh_retouch_metadata_from_manifest(
+        self, project_id: str, manifest: dict[str, Any]
+    ) -> None:
+        active_count = self._watermark_edit_count(manifest)
+        retouch = dict(manifest.get("retouch") or {})
+        retouch["active_watermark_edits"] = active_count
+        retouch["revision"] = int(retouch.get("revision", 0)) + 1
+        if active_count:
+            for entry in reversed(list(manifest.get("history", []))[: int(manifest.get("history_cursor", 0))]):
+                operation = entry.get("operation") or {}
+                if str(operation.get("tool", "")).startswith("watermark"):
+                    retouch["last_engine"] = operation.get("algorithm_version") or operation.get("engine")
+                    break
+        else:
+            retouch["last_engine"] = None
+            # Sau undo watermark cuối cùng, xóa current.png nếu nó trở về đúng RGB canonical.
+            path = self.retouch_path(project_id)
+            if path.exists():
+                try:
+                    with Image.open(self.canonical_path(project_id)) as canonical_image:
+                        canonical_rgb = np.asarray(canonical_image.convert("RGB"), dtype=np.uint8)
+                    with Image.open(path) as retouch_image:
+                        retouch_rgb = np.asarray(retouch_image.convert("RGB"), dtype=np.uint8)
+                    if canonical_rgb.shape == retouch_rgb.shape and np.array_equal(canonical_rgb, retouch_rgb):
+                        path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+        manifest["retouch"] = retouch
+
+    def active_watermark_edit_count(self, project_id: str) -> int:
+        return self._watermark_edit_count(self.manifest(project_id))
+
     def commit_retouch_edit(
         self,
         project_id: str,
@@ -191,31 +266,56 @@ class ProjectStore:
         bounds: tuple[int, int, int, int],
         operation: dict[str, Any],
     ) -> dict[str, Any]:
-        """Ghi ảnh chụp RGB native cho một lần retouch không phá hủy.
-
-        Chỉnh alpha vẫn dùng tile delta; retouch thay RGB nên dùng PNG tách riêng
-        để tiếp tục dùng chung dòng thời gian undo/redo hiện có.
-        """
+        """Ghi tile delta RGB native cho retouch mà không nhân đôi ảnh full-res."""
         manifest = self.manifest(project_id)
         sequence = int(manifest.get("journal_sequence", 0)) + 1
         history = list(manifest.get("history", []))
         cursor = int(manifest.get("history_cursor", len(history)))
         history = history[:cursor]
-        snapshot_dir = self.path(project_id) / "retouch" / "snapshots"
-        snapshot_dir.mkdir(parents=True, exist_ok=True)
-        before_name = f"{sequence:08d}.before.png"
-        after_name = f"{sequence:08d}.after.png"
-        Image.fromarray(np.ascontiguousarray(before, dtype=np.uint8), "RGB").save(snapshot_dir / before_name)
-        Image.fromarray(np.ascontiguousarray(after, dtype=np.uint8), "RGB").save(snapshot_dir / after_name)
+        if before.shape != after.shape or after.ndim != 3 or after.shape[2] != 3:
+            raise ValueError("Retouch RGB before/after không cùng kích thước")
+        x0, y0, x1, y1 = bounds
+        height, width = after.shape[:2]
+        x0 = max(0, min(width, x0))
+        y0 = max(0, min(height, y0))
+        x1 = max(x0, min(width, x1))
+        y1 = max(y0, min(height, y1))
+        delta_dir = self.path(project_id) / "journal" / "rgb-deltas" / f"{sequence:08d}"
+        delta_tiles: list[dict[str, Any]] = []
+        if x1 > x0 and y1 > y0:
+            for tile_y in range(y0 // TILE_SIZE, (y1 - 1) // TILE_SIZE + 1):
+                for tile_x in range(x0 // TILE_SIZE, (x1 - 1) // TILE_SIZE + 1):
+                    tx0 = tile_x * TILE_SIZE
+                    ty0 = tile_y * TILE_SIZE
+                    tx1 = min(width, tx0 + TILE_SIZE)
+                    ty1 = min(height, ty0 + TILE_SIZE)
+                    before_tile = before[ty0:ty1, tx0:tx1]
+                    after_tile = after[ty0:ty1, tx0:tx1]
+                    name = _rgb_tile_name(tile_y, tile_x)
+                    atomic_write_bytes(delta_dir / f"{name}.before", _encode_rgb_tile(before_tile))
+                    atomic_write_bytes(delta_dir / f"{name}.after", _encode_rgb_tile(after_tile))
+                    delta_tiles.append(
+                        {
+                            "tile_x": tile_x,
+                            "tile_y": tile_y,
+                            "shape": [ty1 - ty0, tx1 - tx0, 3],
+                            "name": name,
+                        }
+                    )
         self.write_working_rgb(project_id, after)
         entry = {
-            "sequence": sequence, "operation": operation, "bounds": list(bounds), "tiles": [],
-            "retouch_snapshots": {"before": before_name, "after": after_name}, "created_at": utc_now(),
+            "sequence": sequence,
+            "operation": operation,
+            "bounds": [x0, y0, x1, y1],
+            "tiles": [],
+            "rgb_tiles": delta_tiles,
+            "created_at": utc_now(),
         }
         history.append(entry)
         manifest["history"] = history
         manifest["history_cursor"] = len(history)
         manifest["journal_sequence"] = sequence
+        self._refresh_retouch_metadata_from_manifest(project_id, manifest)
         self.update_manifest(project_id, manifest)
         with (self.path(project_id) / "journal" / "edits.jsonl").open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(entry, ensure_ascii=False) + "\n")
@@ -331,6 +431,7 @@ class ProjectStore:
         manifest["history"] = history
         manifest["history_cursor"] = len(history)
         manifest["journal_sequence"] = sequence
+        self._refresh_retouch_metadata_from_manifest(project_id, manifest)
         self.update_manifest(project_id, manifest)
         journal_path = self.path(project_id) / "journal" / "edits.jsonl"
         with journal_path.open("a", encoding="utf-8") as stream:
@@ -343,6 +444,22 @@ class ProjectStore:
             snapshot = self.path(project_id) / "retouch" / "snapshots" / name
             with Image.open(snapshot) as image:
                 self.write_working_rgb(project_id, np.asarray(image.convert("RGB"), dtype=np.uint8))
+            return
+        if entry.get("rgb_tiles"):
+            rgb = self.read_working_rgb(project_id).copy()
+            for tile in entry["rgb_tiles"]:
+                delta_dir = self.path(project_id) / "journal" / "rgb-deltas" / f"{entry['sequence']:08d}"
+                payload = (delta_dir / f"{tile['name']}.{side}").read_bytes()
+                shape = tuple(int(value) for value in tile["shape"])
+                if len(shape) != 3:
+                    raise ValueError("RGB tile thiếu shape HWC")
+                tile_rgb = _decode_rgb_tile(payload, shape)  # type: ignore[arg-type]
+                tile_x = int(tile["tile_x"])
+                tile_y = int(tile["tile_y"])
+                x0 = tile_x * TILE_SIZE
+                y0 = tile_y * TILE_SIZE
+                rgb[y0 : y0 + tile_rgb.shape[0], x0 : x0 + tile_rgb.shape[1]] = tile_rgb
+            self.write_working_rgb(project_id, rgb)
             return
         delta_dir = self.path(project_id) / "journal" / "deltas" / f"{entry['sequence']:08d}"
         current_dir = self._array_directory(project_id, "current")
@@ -359,6 +476,7 @@ class ProjectStore:
         entry = history[cursor - 1]
         self._apply_history_entry(project_id, entry, "before")
         manifest["history_cursor"] = cursor - 1
+        self._refresh_retouch_metadata_from_manifest(project_id, manifest)
         self.update_manifest(project_id, manifest)
         return entry
 
@@ -371,6 +489,7 @@ class ProjectStore:
         entry = history[cursor]
         self._apply_history_entry(project_id, entry, "after")
         manifest["history_cursor"] = cursor + 1
+        self._refresh_retouch_metadata_from_manifest(project_id, manifest)
         self.update_manifest(project_id, manifest)
         return entry
 
@@ -379,9 +498,14 @@ class ProjectStore:
         manifest["history"] = []
         manifest["history_cursor"] = 0
         manifest["journal_sequence"] = 0
+        self._refresh_retouch_metadata_from_manifest(project_id, manifest)
         self.update_manifest(project_id, manifest)
         delta_dir = self.path(project_id) / "journal" / "deltas"
         if delta_dir.exists():
             shutil.rmtree(delta_dir)
         delta_dir.mkdir(parents=True)
+        rgb_delta_dir = self.path(project_id) / "journal" / "rgb-deltas"
+        if rgb_delta_dir.exists():
+            shutil.rmtree(rgb_delta_dir)
+        rgb_delta_dir.mkdir(parents=True)
         atomic_write_bytes(self.path(project_id) / "journal" / "edits.jsonl", b"")

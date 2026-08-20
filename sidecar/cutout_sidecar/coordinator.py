@@ -32,7 +32,14 @@ from .processor import analyze_components, magic_wand_selection, select_componen
 from .project_store import ProjectStore, atomic_write_json
 from .model_runtime import LocalModelRuntime
 from .worker_supervisor import WorkerSupervisor
-from .watermark import automatic_watermark_mask, brush_mask, inpaint_watermark
+from .watermark_engine.session import (
+    begin_session,
+    cancel_session,
+    load_session,
+    replace_session_mask,
+    save_session,
+    update_session_mask,
+)
 
 
 class Coordinator:
@@ -51,6 +58,14 @@ class Coordinator:
             "import_image": self.import_image,
             "get_project": self.get_project,
             "process_artwork": self.process_artwork,
+            "begin_watermark_session": self.begin_watermark_session,
+            "auto_detect_watermark": self.auto_detect_watermark,
+            "update_watermark_mask": self.update_watermark_mask,
+            "get_watermark_preview": self.get_watermark_preview,
+            "preview_watermark": self.preview_watermark,
+            "commit_watermark": self.commit_watermark,
+            "cancel_watermark": self.cancel_watermark,
+            "regenerate_watermark": self.regenerate_watermark,
             "remove_watermark": self.remove_watermark,
             "apply_brush": self.brush,
             "apply_magic_wand": self.magic_wand,
@@ -87,12 +102,18 @@ class Coordinator:
         }
 
     @staticmethod
-    def _processing_points(value: Any, width: int, height: int, name: str) -> list[dict[str, float]]:
+    def _processing_points(
+        value: Any,
+        width: int,
+        height: int,
+        name: str,
+        max_points: int = 16,
+    ) -> list[dict[str, float]]:
         """Kiểm tra và cố định prompt trong hệ toạ độ canonical của project."""
         if value is None:
             return []
-        if not isinstance(value, list) or len(value) > 16:
-            raise ValueError(f"{name} phải là danh sách tối đa 16 điểm")
+        if not isinstance(value, list) or len(value) > max_points:
+            raise ValueError(f"{name} phải là danh sách tối đa {max_points} điểm")
         points: list[dict[str, float]] = []
         for item in value:
             if not isinstance(item, dict):
@@ -112,6 +133,10 @@ class Coordinator:
             )
         return points
 
+    def _working_rgb_path(self, project_id: str) -> Path:
+        retouch_path = self.store.retouch_path(project_id)
+        return retouch_path if retouch_path.exists() else self.store.canonical_path(project_id)
+
     def import_image(self, params: dict[str, Any]) -> dict[str, Any]:
         canonical = decode_canonical(params["path"])
         manifest = self.store.create(canonical)
@@ -123,7 +148,8 @@ class Coordinator:
 
     def process_artwork(self, params: dict[str, Any]) -> dict[str, Any]:
         project_id = params["project_id"]
-        rgb, _, _ = load_canonical_png(self.store.canonical_path(project_id))
+        rgb = self.store.read_working_rgb(project_id)
+        previous_processing = (self.store.manifest(project_id).get("processing") or {})
         engine_profile = str(params.get("engine_profile", "V3_BALANCED")).upper()
         subject_policy = str(params.get("subject_policy", "ALL_DETECTED")).upper()
         foreground_points = self._processing_points(
@@ -132,25 +158,60 @@ class Coordinator:
         background_points = self._processing_points(
             params.get("background_points"), rgb.shape[1], rgb.shape[0], "background_points"
         )
+        selection_value = params.get("subject_selection_points")
+        if subject_policy == "SELECTED" and selection_value is None:
+            selection_value = previous_processing.get("subject_selection_points")
+            if selection_value is None and "selected_subject_ids" in previous_processing:
+                # Migrate project cũ từ selected IDs sang seed membership ổn định.
+                selected_ids = {
+                    int(value) for value in previous_processing.get("selected_subject_ids", [])
+                }
+                selection_value = []
+                for subject in previous_processing.get("subjects", []):
+                    if int(subject.get("id", -1)) not in selected_ids:
+                        continue
+                    seed = subject.get("seed_point")
+                    if not seed:
+                        x0, y0, x1, y1 = subject["bbox"]
+                        seed = [(x0 + x1) / 2.0, (y0 + y1) / 2.0]
+                    selection_value.append({"x": float(seed[0]), "y": float(seed[1])})
+        subject_selection_points = (
+            self._processing_points(
+                selection_value,
+                rgb.shape[1],
+                rgb.shape[0],
+                "subject_selection_points",
+                max_points=100,
+            )
+            if selection_value is not None
+            else None
+        )
         protection_mode = str(params.get("protection_mode", "CONSERVATIVE")).upper()
         shadow_policy = str(params.get("shadow_policy", "REMOVE")).upper()
+        source_alpha_mode = str(params.get("source_alpha_mode", "PRESERVE")).upper()
         if subject_policy not in {"ALL_DETECTED", "SELECTED"}:
             raise ValueError("Subject policy không hợp lệ")
         if protection_mode != "CONSERVATIVE" or shadow_policy != "REMOVE":
             raise ValueError("Cấu hình bảo toàn vật thể hoặc bóng không hợp lệ")
+        if source_alpha_mode not in {"PRESERVE", "RECOVER_PRIOR_CUTOUT"}:
+            raise ValueError("Source alpha mode không hợp lệ")
         staging_path = self.store.path(project_id) / "alpha" / "staging" / "worker-alpha.npy"
         worker_result = self.worker.request(
             "process_artwork",
             {
                 "canonical_path": str(self.store.canonical_path(project_id)),
+                "working_rgb_path": str(self._working_rgb_path(project_id)),
                 "output_path": str(staging_path),
                 "tolerance": float(params.get("tolerance", 30.0)),
                 "softness": float(params.get("softness", 18.0)),
                 "quality_preset": str(params.get("quality_preset", "QUALITY")),
                 "engine_profile": engine_profile,
+                "subject_policy": subject_policy,
+                "source_alpha_mode": source_alpha_mode,
                 "models_dir": str(self.models_dir),
                 "foreground_points": foreground_points,
                 "background_points": background_points,
+                "subject_selection_points": subject_selection_points,
                 "protection_mode": protection_mode,
                 "shadow_policy": shadow_policy,
             },
@@ -171,11 +232,26 @@ class Coordinator:
             subject["selected"] = True
             subject["confidence"] = "review" if subject["needs_review"] else "detected"
         warnings: list[dict[str, Any]] = []
-        if engine_profile == "V3_AI_LOCAL" and not diagnostics.get("ai_models_used"):
+        ai_pipeline_status = diagnostics.get("ai_pipeline_status")
+        if engine_profile == "V3_AI_LOCAL" and ai_pipeline_status == "fallback":
             warnings.append(
                 {
                     "code": "AI_LOCAL_FALLBACK",
                     "message": "Gói AI chưa sẵn sàng; đã fallback an toàn sang V3 Cân bằng.",
+                }
+            )
+        elif engine_profile == "V3_AI_LOCAL" and ai_pipeline_status == "degraded":
+            warnings.append(
+                {
+                    "code": "AI_LOCAL_DEGRADED",
+                    "message": "Proposal AI đã chạy nhưng matte chi tiết không hoàn tất; cần kiểm tra và khóa vùng vật thể trước khi xuất.",
+                }
+            )
+        if engine_profile == "V3_AI_LOCAL" and diagnostics.get("ai_quality_status") == "pending":
+            warnings.append(
+                {
+                    "code": "AI_QUALITY_PENDING",
+                    "message": "Model đã chạy đúng runtime nhưng chưa qua corpus qualification; cần kiểm tra vùng trong suốt trước khi xuất.",
                 }
             )
         if diagnostics.get("needs_protection"):
@@ -200,8 +276,10 @@ class Coordinator:
             "subject_policy": subject_policy,
             "foreground_points": foreground_points,
             "background_points": background_points,
+            "subject_selection_points": subject_selection_points,
             "protection_mode": protection_mode,
             "shadow_policy": shadow_policy,
+            "source_alpha_mode": source_alpha_mode,
             "result_status": diagnostics.get("result_status", "READY"),
             "diagnostics": diagnostics,
             "ai_models_used": diagnostics.get("ai_models_used", []),
@@ -214,26 +292,205 @@ class Coordinator:
         self._refresh_preview(project_id, self.store.read_working_rgb(project_id), alpha)
         return self._project_payload(project_id)
 
-    def remove_watermark(self, params: dict[str, Any]) -> dict[str, Any]:
+    def _watermark_revision(self, project_id: str) -> tuple[int, int]:
+        """Định danh trạng thái RGB/history để chặn áp dụng preview đã cũ."""
+        manifest = self.store.manifest(project_id)
+        return (
+            int(manifest.get("journal_sequence", 0)),
+            int(manifest.get("history_cursor", 0)),
+        )
+
+    def _validate_watermark_revision(self, project_id: str, metadata: dict[str, Any]) -> None:
+        expected = tuple(int(value) for value in metadata.get("base_revision", (0, 0)))
+        if expected != self._watermark_revision(project_id):
+            raise RuntimeError("Ảnh đã thay đổi; hãy tạo lại phiên watermark trước khi áp dụng")
+
+    def begin_watermark_session(self, params: dict[str, Any]) -> dict[str, Any]:
         project_id = params["project_id"]
-        mode = str(params.get("mode", "AUTO")).upper()
         rgb = self.store.read_working_rgb(project_id)
-        if mode == "AUTO":
-            mask, detection = automatic_watermark_mask(rgb)
-            operation = {"tool": "watermark_auto", "algorithm_version": "opencv-telea-v1", "detection": detection}
-        elif mode == "MANUAL":
-            points = self._processing_points(params.get("points"), rgb.shape[1], rgb.shape[0], "points")
-            mask = brush_mask(rgb.shape[:2], points, float(params.get("radius", 24)))
-            detection = {"pixels": int(np.count_nonzero(mask)), "bounds": []}
-            operation = {"tool": "watermark_manual", "algorithm_version": "opencv-telea-v1", "pixels": detection["pixels"]}
-        else:
-            raise ValueError("Chế độ xoá watermark không hợp lệ")
-        repaired, bounds = inpaint_watermark(rgb, mask)
-        operation["bounds"] = list(bounds)
-        self.store.commit_retouch_edit(project_id, rgb, repaired, bounds, operation)
+        quality = str(params.get("quality", "BALANCED")).upper()
+        if quality not in {"FAST", "BALANCED", "MAXIMUM"}:
+            raise ValueError("Watermark quality không hợp lệ")
+        return begin_session(
+            self.store.path(project_id),
+            project_id,
+            rgb.shape[:2],
+            quality=quality,
+            feather=float(params.get("feather", 8.0)),
+            expand=str(params.get("expand", "MEDIUM")),
+            base_revision=self._watermark_revision(project_id),
+        )
+
+    def auto_detect_watermark(self, params: dict[str, Any]) -> dict[str, Any]:
+        project_id = params["project_id"]
+        session_id = params.get("session_id")
+        if not session_id:
+            session = self.begin_watermark_session(params)
+            session_id = session["session_id"]
+        directory, metadata, _ = load_session(self.store.path(project_id), str(session_id))
+        output_path = directory / "auto-mask.npy"
+        worker_result = self.worker.request(
+            "analyze_watermark",
+            {
+                "image_path": str(self._working_rgb_path(project_id)),
+                "output_path": str(output_path),
+                "feather": float(params.get("feather", metadata.get("feather", 8.0))),
+                "expand": str(params.get("expand", metadata.get("expand", "MEDIUM"))),
+            },
+        )
+        mask = np.load(output_path, allow_pickle=False).astype(np.float32)
+        diagnostics = dict(worker_result.get("diagnostics") or {})
+        diagnostics["worker_pid"] = worker_result.get("worker_pid")
+        return replace_session_mask(
+            self.store.path(project_id),
+            str(session_id),
+            mask,
+            diagnostics,
+            "AUTO",
+        )
+
+    def update_watermark_mask(self, params: dict[str, Any]) -> dict[str, Any]:
+        project_id = params["project_id"]
+        session_id = params.get("session_id")
+        if not session_id:
+            session = self.begin_watermark_session(params)
+            session_id = session["session_id"]
+        points = params.get("points") or []
+        if not isinstance(points, list) or len(points) > 5000:
+            raise ValueError("points watermark mỗi request tối đa 5000 điểm")
+        return update_session_mask(
+            self.store.path(project_id),
+            str(session_id),
+            points,
+            float(params.get("radius", 24)),
+            float(params.get("hardness", 0.8)),
+            float(params.get("feather", 0.0)),
+            str(params.get("mode", "ADD")),
+        )
+
+    def get_watermark_preview(self, params: dict[str, Any]) -> dict[str, Any]:
+        project_id = params["project_id"]
+        directory, metadata, mask = load_session(self.store.path(project_id), str(params["session_id"]))
+        return save_session(directory, metadata, mask)
+
+    def preview_watermark(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Tạo ảnh phục hồi tạm; working RGB chỉ đổi sau khi người dùng Apply."""
+        project_id = str(params["project_id"])
+        session_id = str(params["session_id"])
+        directory, metadata, mask = load_session(self.store.path(project_id), session_id)
+        if not np.any(mask > 0.01):
+            raise ValueError("Chưa có vùng watermark để xóa")
+        self._validate_watermark_revision(project_id, metadata)
+        quality = str(params.get("quality", metadata.get("quality", "BALANCED"))).upper()
+        if quality not in {"FAST", "BALANCED", "MAXIMUM"}:
+            raise ValueError("Watermark quality không hợp lệ")
+        output_path = directory / "restored-preview.png"
+        worker_result = self.worker.request(
+            "restore_watermark",
+            {
+                "image_path": str(self._working_rgb_path(project_id)),
+                "mask_path": str(directory / "mask.npy"),
+                "output_path": str(output_path),
+                "quality": quality,
+                "models_dir": str(self.models_dir),
+            },
+        )
+        diagnostics = dict(worker_result.get("diagnostics") or {})
+        diagnostics["worker_pid"] = worker_result.get("worker_pid")
+        metadata["quality"] = quality
+        metadata["status"] = "READY"
+        metadata["preview_diagnostics"] = diagnostics
+        return save_session(directory, metadata, mask)
+
+    def commit_watermark(self, params: dict[str, Any]) -> dict[str, Any]:
+        project_id = params["project_id"]
+        session_id = str(params["session_id"])
+        directory, metadata, mask = load_session(self.store.path(project_id), session_id)
+        if not np.any(mask > 0.01):
+            raise ValueError("Chưa có vùng watermark để xóa")
+        self._validate_watermark_revision(project_id, metadata)
+        preview_path = directory / "restored-preview.png"
+        if metadata.get("status") != "READY" or not preview_path.is_file():
+            raise RuntimeError("Cần tạo và kiểm tra preview watermark trước khi áp dụng")
+        before = self.store.read_working_rgb(project_id)
+        with Image.open(preview_path) as image:
+            repaired = np.ascontiguousarray(np.asarray(image.convert("RGB"), dtype=np.uint8))
+        diagnostics = dict(metadata.get("preview_diagnostics") or {})
+        bounds = tuple(
+            int(value)
+            for value in diagnostics.get("bounds", [0, 0, before.shape[1], before.shape[0]])
+        )
+        selected = diagnostics.get("selected") or {}
+        operation = {
+            "tool": "watermark_v2",
+            "algorithm_version": diagnostics.get("algorithm_version", "watermark-restore-v2-router"),
+            "session_id": session_id,
+            "quality": str(metadata.get("quality", "BALANCED")).upper(),
+            "mask_pixels": int(np.count_nonzero(mask > 0.01)),
+            "bounds": list(bounds),
+            "engine": selected.get("route"),
+            "diagnostics": diagnostics,
+        }
+        self.store.commit_retouch_edit(project_id, before, repaired, bounds, operation)
+        cancel_session(self.store.path(project_id), session_id)
         alpha = self.store.read_alpha(project_id)
         self._refresh_preview(project_id, repaired, alpha)
         return self._project_payload(project_id)
+
+    def cancel_watermark(self, params: dict[str, Any]) -> dict[str, Any]:
+        return cancel_session(self.store.path(params["project_id"]), str(params["session_id"]))
+
+    def regenerate_watermark(self, params: dict[str, Any]) -> dict[str, Any]:
+        return self.preview_watermark(params)
+
+    def remove_watermark(self, params: dict[str, Any]) -> dict[str, Any]:
+        project_id = params["project_id"]
+        mode = str(params.get("mode", "AUTO")).upper()
+        session = self.begin_watermark_session(
+            {
+                "project_id": project_id,
+                "quality": params.get("quality", "BALANCED"),
+                "feather": params.get("feather", 8.0),
+                "expand": params.get("expand", "MEDIUM"),
+            }
+        )
+        try:
+            if mode == "AUTO":
+                session = self.auto_detect_watermark(
+                    {
+                        "project_id": project_id,
+                        "session_id": session["session_id"],
+                        "feather": params.get("feather", 8.0),
+                        "expand": params.get("expand", "MEDIUM"),
+                    }
+                )
+            elif mode == "MANUAL":
+                session = self.update_watermark_mask(
+                    {
+                        "project_id": project_id,
+                        "session_id": session["session_id"],
+                        "points": params.get("points") or [],
+                        "radius": params.get("radius", 24),
+                        "hardness": params.get("hardness", 1.0),
+                        "feather": params.get("feather", 0.0),
+                        "mode": "ADD",
+                    }
+                )
+            else:
+                raise ValueError("Chế độ xoá watermark không hợp lệ")
+            self.preview_watermark(
+                {
+                    "project_id": project_id,
+                    "session_id": session["session_id"],
+                    "quality": params.get("quality", "BALANCED"),
+                }
+            )
+            return self.commit_watermark(
+                {"project_id": project_id, "session_id": session["session_id"]}
+            )
+        except Exception:
+            cancel_session(self.store.path(project_id), session["session_id"])
+            raise
 
     def brush(self, params: dict[str, Any]) -> dict[str, Any]:
         project_id = params["project_id"]
@@ -379,6 +636,17 @@ class Coordinator:
         processing = manifest.get("processing") or {}
         processing["subject_policy"] = "SELECTED"
         processing["selected_subject_ids"] = sorted(selected_ids)
+        selection_points: list[dict[str, float]] = []
+        for subject in processing.get("subjects", []):
+            if int(subject.get("id", -1)) not in selected_ids:
+                continue
+            seed = subject.get("seed_point")
+            if not seed:
+                # Project cũ chưa có seed_point dùng tâm bbox; lần process sau sẽ ghi seed ổn định.
+                x0, y0, x1, y1 = subject["bbox"]
+                seed = [(x0 + x1) / 2.0, (y0 + y1) / 2.0]
+            selection_points.append({"x": float(seed[0]), "y": float(seed[1])})
+        processing["subject_selection_points"] = selection_points
         for subject in processing.get("subjects", []):
             subject["selected"] = int(subject.get("id", -1)) in selected_ids
         manifest["processing"] = processing
@@ -465,7 +733,7 @@ class Coordinator:
             runtime=LocalModelRuntime(self.models_dir),
             cancel_check=cancel_check,
         )
-        if output_mode == "MASTER_SOURCE_FAITHFUL" and not self.store.retouch_path(project_id).exists():
+        if output_mode == "MASTER_SOURCE_FAITHFUL" and self.store.active_watermark_edit_count(project_id) <= 0:
             with Image.open(result["path"]) as exported:
                 exported_rgb = np.asarray(exported.convert("RGBA"), dtype=np.uint8)[:, :, :3]
             result["rgb_integrity"] = bool(np.array_equal(rgb, exported_rgb))
@@ -629,5 +897,10 @@ class Coordinator:
             },
             "process": processing,
             "warnings": processing_warnings,
-            "retouch": {"watermark_removed": self.store.retouch_path(project_id).exists()},
+            "retouch": {
+                "watermark_removed": self.store.active_watermark_edit_count(project_id) > 0,
+                "active_watermark_edits": self.store.active_watermark_edit_count(project_id),
+                "revision": (manifest.get("retouch") or {}).get("revision", 0),
+                "last_engine": (manifest.get("retouch") or {}).get("last_engine"),
+            },
         }

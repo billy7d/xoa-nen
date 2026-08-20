@@ -24,6 +24,8 @@ MODEL_PACK_SCHEMA = "1.0.0"
 # Khóa local này dùng để xác minh hai artifact ONNX đã qualification sơ bộ trên máy.
 TRUSTED_SIGNING_KEYS: dict[str, str] = {
     "local-qualified-2026-08": "+E8YMcnYkQGw/jeE8dmmY7C0CUfQZEH+Y+9Rjye8Rf4=",
+    # Khóa công khai cho model-pack watermark cài cục bộ; private key chỉ nằm trong models/ bị Git ignore.
+    "local-watermark-2026-08": "WKMmaHS6v7Pg4iXvxGkb333LgW6vUUSHGZyj1J4A4fI=",
 }
 
 PROVISIONAL_MODELS = [
@@ -82,9 +84,9 @@ PROVISIONAL_MODELS = [
         "runtime_remote_code_allowed": False,
         "download_url": None,
     },
-    {
-        "model_id": "facebook/sam2.1-hiera-base-plus",
-        "role": "conditional_topology",
+        {
+            "model_id": "facebook/sam2.1-hiera-base-plus",
+            "role": "conditional_topology",
         "adapter": "sam2-conditional-v1",
         "status": "challenger_not_release_blocking",
         "installed": False,
@@ -261,6 +263,32 @@ PROVISIONAL_MODELS.extend(
             "runtime_remote_code_allowed": False,
             "download_url": None,
         },
+        {
+            "model_id": "saic-mdal/lama-watermark-inpaint-onnx",
+            "role": "watermark_inpaint_fast",
+            "adapter": "lama-v1",
+            "status": "qualification_required",
+            "installed": False,
+            "revision": "PIN_EXACT_REVISION_DURING_QUALIFICATION",
+            "weight_sha256": None,
+            "weight_size": None,
+            "code_revision": "VENDORED_ONNX_ADAPTER_REQUIRED",
+            "code_license": "Apache-2.0_OR_MODEL_CARD_VERIFY",
+            "weight_license": "MODEL_CARD_VERIFY_EXACT_REVISION",
+            "commercial_pod_allowed": False,
+            "redistribution_allowed": False,
+            "preprocess_version": "lama-watermark-v1",
+            "priority": 100,
+            "input_size": [1024, 1024],
+            "input_layout": "NCHW",
+            "mask_input_layout": "NCHW",
+            "normalization": "zero_one",
+            "output_layout": "NCHW",
+            "output_range": "zero_one",
+            "qualified_backends": [],
+            "runtime_remote_code_allowed": False,
+            "download_url": None,
+        },
     ]
 )
 
@@ -315,6 +343,7 @@ def _artifact_entries(manifest: dict[str, Any]) -> list[dict[str, Any]]:
 
 def inspect_installed_manifest(manifest_path: Path) -> dict[str, Any]:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    declared_status = str(manifest.get("status", "")).lower()
     manifest["signature_valid"] = _signature_valid(manifest)
     manifest["install_path"] = str(manifest_path.parent.resolve())
     artifacts = _artifact_entries(manifest)
@@ -347,13 +376,19 @@ def inspect_installed_manifest(manifest_path: Path) -> dict[str, Any]:
         and not manifest.get("runtime_remote_code_allowed", False)
         and manifest.get("qualified_backends")
     )
-    ready = bool(all_valid and manifest["signature_valid"] and policy_valid)
+    runtime_ready = bool(all_valid and manifest["signature_valid"] and policy_valid)
+    quality_qualified = declared_status in {"quality_qualified", "release_qualified"}
     manifest["artifacts_status"] = artifact_status
     manifest["checksum_valid"] = all_valid
     manifest["policy_valid"] = policy_valid
-    manifest["installed"] = ready
-    if ready:
+    manifest["installed"] = runtime_ready
+    manifest["runtime_ready"] = runtime_ready
+    manifest["quality_qualified"] = quality_qualified
+    manifest["declared_status"] = declared_status or None
+    if runtime_ready and quality_qualified:
         manifest["status"] = "ready"
+    elif runtime_ready:
+        manifest["status"] = "runtime_ready_quality_pending"
     elif not manifest["signature_valid"]:
         manifest["status"] = "untrusted_signature"
     elif not all_valid:
