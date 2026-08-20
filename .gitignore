@@ -18,3 +18,12 @@ sidecar/dist/
 sidecar/build/
 *.spec
 
+# Platform-specific application bundles and installers.
+# Keep shared source/features in Git; build these artifacts locally per OS.
+*.app/
+*.exe
+*.dmg
+*.pkg
+*.msi
+*.appx
+*.msix
