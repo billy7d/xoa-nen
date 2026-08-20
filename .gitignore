@@ -18,4 +18,5 @@ sidecar/dist/
 sidecar/build/
 *.spec
 artifacts/
+*.app/
 
