@@ -1,13 +1,20 @@
 use serde_json::Value;
 use std::env;
+use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Manager, State};
 
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+
 #[cfg(target_os = "macos")]
 use tauri::Emitter;
+
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 #[cfg(target_os = "macos")]
 #[derive(Clone, serde::Serialize)]
@@ -107,10 +114,22 @@ impl CoordinatorProcess {
             .env("CUTOUT_PROJECTS_DIR", app_data.join("projects"))
             .env("CUTOUT_MODELS_DIR", app_data.join("models"));
 
+        #[cfg(target_os = "windows")]
+        // Ngăn sidecar và các worker con tự tạo cửa sổ terminal khi app chạy nền.
+        command.creation_flags(CREATE_NO_WINDOW);
+
+        let sidecar_stderr = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            // Ghi log theo từng phiên để không phình AppData mà vẫn có dữ liệu chẩn đoán lỗi.
+            .open(app_data.join("sidecar.stderr.log"))
+            .map_err(|error| format!("Không mở được log sidecar: {error}"))?;
+
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::from(sidecar_stderr))
             .spawn()
             .map_err(|error| {
                 format!(

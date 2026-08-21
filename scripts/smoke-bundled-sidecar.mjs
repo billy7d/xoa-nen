@@ -1,15 +1,19 @@
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
-import { resolve } from "node:path";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 
 const [executable, imagePath] = process.argv.slice(2);
 if (!executable || !imagePath) {
   throw new Error("Usage: node scripts/smoke-bundled-sidecar.mjs <sidecar> <image>");
 }
 
+// Tạo thư mục tạm đa nền tảng để smoke test không ghi nhầm vào ổ đĩa gốc trên Windows.
+const smokeRoot = await mkdtemp(join(tmpdir(), "cutout-v3-bundled-smoke-"));
 const child = spawn(resolve(executable), [], {
   stdio: ["pipe", "pipe", "inherit"],
-  env: { ...process.env, CUTOUT_PROJECTS_DIR: "/tmp/cutout-v3-bundled-smoke/projects" },
+  env: { ...process.env, CUTOUT_PROJECTS_DIR: join(smokeRoot, "projects") },
 });
 const lines = createInterface({ input: child.stdout });
 const pending = new Map();
@@ -51,4 +55,5 @@ try {
 } finally {
   child.stdin.end();
   await new Promise((resolvePromise) => child.once("exit", resolvePromise));
+  await rm(smokeRoot, { recursive: true, force: true });
 }

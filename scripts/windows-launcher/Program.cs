@@ -83,20 +83,34 @@ internal static class Program
             try
             {
                 var projectDir = AppDomain.CurrentDomain.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar);
+                var installedApp = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "Local POD Cutout Editor",
+                    "local-pod-cutout-editor.exe");
                 var npm = @"D:\nodeJS\npm.cmd";
                 var python = Path.Combine(projectDir, ".venv", "Scripts", "python.exe");
                 var cargoHome = @"E:\DevTools\Rust\cargo";
                 var rustupHome = @"E:\DevTools\Rust\rustup";
                 var cargoBin = Path.Combine(cargoHome, "bin");
-
-                ValidateRequiredFiles(projectDir, npm, python, cargoBin);
+                var runDev = Array.Exists(args, argument => string.Equals(argument, "--dev", StringComparison.OrdinalIgnoreCase));
 
                 // Chế độ kiểm tra dùng khi build launcher, không khởi động giao diện.
                 if (args.Length > 0 && string.Equals(args[0], "--check", StringComparison.OrdinalIgnoreCase))
                 {
+                    if (!File.Exists(installedApp))
+                    {
+                        ValidateRequiredFiles(projectDir, npm, python, cargoBin);
+                    }
                     return 0;
                 }
 
+                // Mặc định mở bản đã cài: khởi động nhanh, không dựng Vite/Cargo và không tạo terminal dev.
+                if (!runDev && File.Exists(installedApp))
+                {
+                    return RunInstalledApp(installedApp);
+                }
+
+                ValidateRequiredFiles(projectDir, npm, python, cargoBin);
                 return RunApp(projectDir, npm, python, cargoHome, rustupHome, cargoBin);
             }
             catch (Exception error)
@@ -173,6 +187,43 @@ internal static class Program
         finally
         {
             // Đóng Job Object sẽ kết thúc cmd, npm, Vite, Cargo, app và sidecar còn sót.
+            CloseHandle(job);
+        }
+    }
+
+    private static int RunInstalledApp(string executable)
+    {
+        var job = CreateKillOnCloseJob();
+        try
+        {
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = executable,
+                WorkingDirectory = Path.GetDirectoryName(executable),
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                WindowStyle = ProcessWindowStyle.Hidden
+            };
+
+            using (var process = Process.Start(startInfo))
+            {
+                if (process == null)
+                {
+                    throw new InvalidOperationException("Không tạo được tiến trình bản ứng dụng đã cài.");
+                }
+
+                if (!AssignProcessToJobObject(job, process.Handle))
+                {
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "Không gắn được ứng dụng đã cài vào nhóm giám sát.");
+                }
+
+                process.WaitForExit();
+                return process.ExitCode;
+            }
+        }
+        finally
+        {
+            // Đóng launcher cũng kết thúc đúng tiến trình app đã mở từ launcher.
             CloseHandle(job);
         }
     }

@@ -41,6 +41,8 @@ const args = [
   "--noconfirm",
   "--clean",
   "--onefile",
+  // Sidecar chỉ giao tiếp qua pipe JSON, không cần console Windows hiện ra cho người dùng.
+  "--noconsole",
   "--name",
   "cutout-sidecar",
   "--distpath",
