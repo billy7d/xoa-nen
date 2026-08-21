@@ -26,6 +26,10 @@ TRUSTED_SIGNING_KEYS: dict[str, str] = {
     "local-qualified-2026-08": "+E8YMcnYkQGw/jeE8dmmY7C0CUfQZEH+Y+9Rjye8Rf4=",
     # Khóa công khai cho model-pack watermark cài cục bộ; private key chỉ nằm trong models/ bị Git ignore.
     "local-watermark-2026-08": "WKMmaHS6v7Pg4iXvxGkb333LgW6vUUSHGZyj1J4A4fI=",
+    # Khóa công khai của pack LaMa AI-only được xác minh bằng SHA-256 trước khi cài.
+    "local-watermark-ai-only-2026-08": "M/3HFb13byieVfiRPZHhLkVingfVhzV7jnWWsCdLxP4=",
+    # Khóa công khai của pack LaMa ONNX OpenCV tối ưu cho lấp watermark cục bộ.
+    "local-watermark-opencv-ai-2026-08": "ZyGz07MJEIKCfAVgbkOcOs6ln1MufIrmTQC2UjhTKkI=",
 }
 
 PROVISIONAL_MODELS = [

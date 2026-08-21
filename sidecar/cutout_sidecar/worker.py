@@ -57,6 +57,18 @@ def load_rgb_image(path: Path) -> np.ndarray:
         return np.ascontiguousarray(np.asarray(image.convert("RGB"), dtype=np.uint8))
 
 
+def _configure_utf8_system_stream(stream: TextIO, system_stream: TextIO) -> None:
+    """Giữ JSON IPC tiếng Việt ổn định trên console Windows dùng code page cũ."""
+    if stream is not system_stream:
+        return
+    reconfigure = getattr(stream, "reconfigure", None)
+    if callable(reconfigure):
+        try:
+            reconfigure(encoding="utf-8", errors="strict")
+        except (OSError, ValueError):
+            pass
+
+
 def process_request(request: dict[str, Any]) -> dict[str, Any]:
     method = request.get("method")
     params = request.get("params") or {}
@@ -244,6 +256,8 @@ def serve_worker_stdio(
 ) -> None:
     input_stream = input_stream or sys.stdin
     output_stream = output_stream or sys.stdout
+    _configure_utf8_system_stream(input_stream, sys.stdin)
+    _configure_utf8_system_stream(output_stream, sys.stdout)
     for line in input_stream:
         if not line.strip():
             continue

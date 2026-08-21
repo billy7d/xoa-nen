@@ -341,6 +341,11 @@ class Coordinator:
         mask = np.load(output_path, allow_pickle=False).astype(np.float32)
         diagnostics = dict(worker_result.get("diagnostics") or {})
         diagnostics["worker_pid"] = worker_result.get("worker_pid")
+        if not np.any(mask > 0.01):
+            raise RuntimeError(
+                "Tự động không tìm thấy watermark đủ tin cậy; ảnh chưa bị thay đổi. "
+                "Hãy dùng Brush + để khoanh đúng watermark."
+            )
         return replace_session_mask(
             self.store.path(project_id),
             str(session_id),

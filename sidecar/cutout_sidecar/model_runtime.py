@@ -495,6 +495,9 @@ class LocalModelRuntime:
             if session is None:
                 # DirectML yêu cầu chạy tuần tự và tắt memory-pattern để tránh lỗi/VRAM dư.
                 options = ort.SessionOptions() if hasattr(ort, "SessionOptions") else None
+                if options is not None and hasattr(options, "log_severity_level"):
+                    # Không để warning ONNX từ model phát hành làm nhiễu JSON IPC của worker.
+                    options.log_severity_level = 3
                 if options is not None and "DmlExecutionProvider" in providers:
                     options.enable_mem_pattern = False
                     options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
@@ -665,7 +668,7 @@ class LocalModelRuntime:
         role: str = "watermark_inpaint_fast",
         context: dict[str, Any] | None = None,
     ) -> tuple[np.ndarray | None, dict[str, Any]]:
-        """Chạy ONNX inpainting bằng image+mask; thiếu pack thì fallback ở router."""
+        """Chạy ONNX inpainting bằng image+mask; thiếu pack phải báo rõ cho người dùng."""
         started = time.perf_counter()
         manifest = self._ready(role)
         if manifest is None:
@@ -687,6 +690,10 @@ class LocalModelRuntime:
             mask_index = 1 if len(model_inputs) > 1 else 0
             mask_name = self._input_name(manifest, model_inputs, "mask_input_name", index=mask_index)
             mask_values = _resize_float(np.clip(mask.astype(np.float32), 0.0, 1.0), input_size)
+            if adapter in {"lama-v1", "lama"}:
+                # Contract LaMa của OpenCV nhị phân hóa mask sau khi resize; giá trị xám
+                # làm model hiểu sai vùng cần sinh và dễ tạo mảng màu không liên quan.
+                mask_values = (mask_values > 0.0).astype(np.float32)
             mask_layout = str(manifest.get("mask_input_layout", layout)).upper()
             mask_tensor = _tensor(mask_values, mask_layout)
             outputs = session.run(

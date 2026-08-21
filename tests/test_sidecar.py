@@ -13,7 +13,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
-from PIL import Image, ImageCms
+from PIL import Image, ImageCms, ImageDraw
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
@@ -43,7 +43,9 @@ from cutout_sidecar.processor import (  # noqa: E402
 from cutout_sidecar.project_store import ProjectStore  # noqa: E402
 from cutout_sidecar.protocol import handle_request, serve_stdio  # noqa: E402
 from cutout_sidecar.watermark_engine.mask import apply_stroke_to_mask, rasterize_stroke  # noqa: E402
+from cutout_sidecar.watermark_engine.detector import detect_watermark  # noqa: E402
 from cutout_sidecar.watermark_engine.inpaint import restore_roi_with_candidate  # noqa: E402
+from cutout_sidecar.watermark_engine.pipeline import restore_watermark  # noqa: E402
 
 
 def artwork_fixture(path: Path) -> tuple[np.ndarray, np.ndarray]:
@@ -572,6 +574,38 @@ class CoordinatorFlowTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def _mock_watermark_ai(self):
+        original_request = self.coordinator.worker.request
+
+        def request(method: str, params: dict[str, object]) -> dict[str, object]:
+            if method != "restore_watermark":
+                return original_request(method, params)
+            # Mô phỏng output AI để test phiên/undo không phụ thuộc artifact ONNX bên ngoài.
+            image_path = Path(str(params["image_path"]))
+            mask_path = Path(str(params["mask_path"]))
+            output_path = Path(str(params["output_path"]))
+            with Image.open(image_path) as image:
+                rgb = np.ascontiguousarray(np.asarray(image.convert("RGB"), dtype=np.uint8))
+            mask = np.load(mask_path, allow_pickle=False).astype(np.float32)
+            output = rgb.copy()
+            changed = mask > 0.01
+            output[changed] = np.array([38, 168, 123], dtype=np.uint8)
+            Image.fromarray(output, "RGB").save(output_path)
+            ys, xs = np.where(changed)
+            bounds = [int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1]
+            return {
+                "output_path": str(output_path),
+                "bounds": bounds,
+                "diagnostics": {
+                    "algorithm_version": "watermark-restore-v3-ai-local",
+                    "selected": {"route": "AI_FAST", "model_id": "test-local-ai"},
+                    "bounds": bounds,
+                },
+                "worker_pid": 12345,
+            }
+
+        return patch.object(self.coordinator.worker, "request", side_effect=request)
+
     def test_import_process_edit_undo_redo_preflight_and_exports(self) -> None:
         imported = self.coordinator.dispatch("import_image", {"path": str(self.source)})
         project_id = imported["project_id"]
@@ -703,15 +737,16 @@ class CoordinatorFlowTests(unittest.TestCase):
         imported = self.coordinator.dispatch("import_image", {"path": str(self.source)})
         project_id = imported["project_id"]
         before = self.coordinator.store.read_working_rgb(project_id).copy()
-        result = self.coordinator.dispatch(
-            "remove_watermark",
-            {
-                "project_id": project_id,
-                "mode": "MANUAL",
-                "points": [{"x": 61, "y": 47}, {"x": 64, "y": 47}],
-                "radius": 5,
-            },
-        )
+        with self._mock_watermark_ai():
+            result = self.coordinator.dispatch(
+                "remove_watermark",
+                {
+                    "project_id": project_id,
+                    "mode": "MANUAL",
+                    "points": [{"x": 61, "y": 47}, {"x": 64, "y": 47}],
+                    "radius": 5,
+                },
+            )
         after = self.coordinator.store.read_working_rgb(project_id)
         self.assertEqual(after.shape, before.shape)
         self.assertTrue(result["retouch"]["watermark_removed"])
@@ -799,27 +834,28 @@ class CoordinatorFlowTests(unittest.TestCase):
         self.assertGreater(updated["mask_pixel_count"], 0)
         self.assertTrue(Path(updated["mask_preview_path"]).is_file())
         before = self.coordinator.store.read_working_rgb(project_id).copy()
-        preview = self.coordinator.dispatch(
-            "preview_watermark",
-            {
-                "project_id": project_id,
-                "session_id": session["session_id"],
-                "quality": "FAST",
-            },
-        )
-        self.assertEqual(preview["status"], "READY")
-        self.assertTrue(Path(preview["preview_path"]).is_file())
-        np.testing.assert_array_equal(self.coordinator.store.read_working_rgb(project_id), before)
-        with Image.open(preview["preview_path"]) as image:
-            preview_rgb = np.asarray(image.convert("RGB"), dtype=np.uint8).copy()
-        committed = self.coordinator.dispatch(
-            "commit_watermark",
-            {
-                "project_id": project_id,
-                "session_id": session["session_id"],
-                "quality": "FAST",
-            },
-        )
+        with self._mock_watermark_ai():
+            preview = self.coordinator.dispatch(
+                "preview_watermark",
+                {
+                    "project_id": project_id,
+                    "session_id": session["session_id"],
+                    "quality": "FAST",
+                },
+            )
+            self.assertEqual(preview["status"], "READY")
+            self.assertTrue(Path(preview["preview_path"]).is_file())
+            np.testing.assert_array_equal(self.coordinator.store.read_working_rgb(project_id), before)
+            with Image.open(preview["preview_path"]) as image:
+                preview_rgb = np.asarray(image.convert("RGB"), dtype=np.uint8).copy()
+            committed = self.coordinator.dispatch(
+                "commit_watermark",
+                {
+                    "project_id": project_id,
+                    "session_id": session["session_id"],
+                    "quality": "FAST",
+                },
+            )
         after = self.coordinator.store.read_working_rgb(project_id).copy()
         self.assertEqual(after.shape, before.shape)
         np.testing.assert_array_equal(after, preview_rgb)
@@ -856,10 +892,11 @@ class CoordinatorFlowTests(unittest.TestCase):
                 "feather": 0,
             },
         )
-        preview = self.coordinator.dispatch(
-            "preview_watermark",
-            {"project_id": project_id, "session_id": session["session_id"], "quality": "FAST"},
-        )
+        with self._mock_watermark_ai():
+            preview = self.coordinator.dispatch(
+                "preview_watermark",
+                {"project_id": project_id, "session_id": session["session_id"], "quality": "FAST"},
+            )
         self.assertEqual(preview["status"], "READY")
 
         changed_mask = self.coordinator.dispatch(
@@ -877,10 +914,11 @@ class CoordinatorFlowTests(unittest.TestCase):
         self.assertEqual(changed_mask["status"], "EDITING")
         self.assertIsNone(changed_mask["preview_path"])
 
-        self.coordinator.dispatch(
-            "preview_watermark",
-            {"project_id": project_id, "session_id": session["session_id"], "quality": "FAST"},
-        )
+        with self._mock_watermark_ai():
+            self.coordinator.dispatch(
+                "preview_watermark",
+                {"project_id": project_id, "session_id": session["session_id"], "quality": "FAST"},
+            )
         self.coordinator.dispatch(
             "apply_brush",
             {
@@ -908,6 +946,112 @@ class CoordinatorFlowTests(unittest.TestCase):
         np.testing.assert_array_equal(restored[3, 3], [200, 200, 200])
         self.assertTrue(np.all((restored[3, 2] > 0) & (restored[3, 2] < 200)))
         np.testing.assert_array_equal(restored[0, 0], [0, 0, 0])
+
+    def test_auto_detector_finds_sparkle_without_selecting_the_scene(self) -> None:
+        height, width = 256, 320
+        yy, xx = np.mgrid[:height, :width]
+        rgb = np.zeros((height, width, 3), dtype=np.uint8)
+        rgb[:, :, 0] = np.clip(54 + xx * 0.22 + yy * 0.08, 0, 255)
+        rgb[:, :, 1] = np.clip(76 + xx * 0.12 + yy * 0.10, 0, 255)
+        rgb[:, :, 2] = np.clip(48 + xx * 0.08 + yy * 0.06, 0, 255)
+        image = Image.fromarray(rgb, "RGB")
+        draw = ImageDraw.Draw(image)
+        size, x0, y0 = 28, 276, 216
+        angles = np.linspace(0.0, np.pi * 2.0, 240, endpoint=False)
+        # Fixture dùng exponent khác detector để test không chỉ lặp lại đúng template nội bộ.
+        points = [
+            (
+                x0 + size / 2 + (size - 7) / 2 * np.sign(np.cos(angle)) * abs(np.cos(angle)) ** 2.8,
+                y0 + size / 2 + (size - 7) / 2 * np.sign(np.sin(angle)) * abs(np.sin(angle)) ** 2.8,
+            )
+            for angle in angles
+        ]
+        draw.polygon(points, fill=(192, 193, 176))
+
+        detection = detect_watermark(np.asarray(image, dtype=np.uint8))
+
+        self.assertEqual(detection.diagnostics["detector"], "GEMINI_SPARKLE_NCC")
+        x1, y1, x2, y2 = detection.diagnostics["bounds"]
+        self.assertLessEqual(abs(x1 - x0), 3)
+        self.assertLessEqual(abs(y1 - y0), 3)
+        self.assertLess(float(np.mean(detection.confidence > 0.01)), 0.02)
+
+    def test_auto_detector_rejects_scene_wide_classical_mask(self) -> None:
+        blocks = ((np.indices((192, 224)).sum(axis=0) // 4) % 2 * 255).astype(np.uint8)
+        rgb = np.dstack((blocks, blocks, blocks))
+
+        detection = detect_watermark(rgb)
+
+        self.assertEqual(int(np.count_nonzero(detection.confidence)), 0)
+        self.assertTrue(detection.diagnostics["safety_rejected"])
+
+    def test_watermark_restore_requires_local_ai_and_never_routes_to_algorithm(self) -> None:
+        class FakeLocalAiRuntime:
+            def __init__(self) -> None:
+                self.roles: list[str] = []
+
+            def has_role(self, role: str) -> bool:
+                return role in {"watermark_inpaint_fast", "watermark_inpaint_quality"}
+
+            def inpaint_rgb(self, rgb: np.ndarray, _mask: np.ndarray, role: str, **_kwargs: object):
+                self.roles.append(role)
+                if role == "watermark_inpaint_quality":
+                    return None, {"status": "inference_failed", "role": role}
+                return np.full_like(rgb, 76), {"status": "ok", "model_id": "test-local-ai"}
+
+        rgb = np.full((24, 24, 3), 230, dtype=np.uint8)
+        mask = np.zeros((24, 24), dtype=np.float32)
+        mask[8:16, 8:16] = 1.0
+        runtime = FakeLocalAiRuntime()
+        with patch(
+            "cutout_sidecar.watermark_engine.pipeline.score_candidate",
+            return_value={"overall": 0.95, "changed_mean": 12.0},
+        ):
+            restored, bounds, diagnostics = restore_watermark(
+                rgb, mask, quality="MAXIMUM", runtime=runtime
+            )
+        self.assertEqual(runtime.roles, ["watermark_inpaint_quality", "watermark_inpaint_fast"])
+        self.assertEqual(diagnostics["algorithm_version"], "watermark-restore-v3.1-ai-local-gated")
+        self.assertEqual(diagnostics["selected"]["route"], "AI_FAST")
+        self.assertTrue(all(str(item["route"]).startswith("AI_") for item in diagnostics["attempts"]))
+        self.assertEqual(bounds, (8, 8, 16, 16))
+        np.testing.assert_array_equal(restored[0, 0], rgb[0, 0])
+        np.testing.assert_array_equal(restored[12, 12], [76, 76, 76])
+
+        with self.assertRaisesRegex(RuntimeError, "Cần model AI local lấp nền watermark"):
+            restore_watermark(rgb, mask, quality="BALANCED", runtime=None)
+
+        with patch(
+            "cutout_sidecar.watermark_engine.pipeline.score_candidate",
+            return_value={"overall": 0.41, "changed_mean": 12.0},
+        ), self.assertRaisesRegex(RuntimeError, "chưa tái tạo nền đạt quality gate"):
+            restore_watermark(rgb, mask, quality="BALANCED", runtime=runtime)
+
+    def test_watermark_preview_without_ai_model_keeps_project_unchanged(self) -> None:
+        imported = self.coordinator.dispatch("import_image", {"path": str(self.source)})
+        project_id = imported["project_id"]
+        before = self.coordinator.store.read_working_rgb(project_id).copy()
+        session = self.coordinator.dispatch(
+            "begin_watermark_session", {"project_id": project_id, "quality": "FAST"}
+        )
+        self.coordinator.dispatch(
+            "update_watermark_mask",
+            {
+                "project_id": project_id,
+                "session_id": session["session_id"],
+                "mode": "ADD",
+                "points": [{"x": 61, "y": 47}],
+                "radius": 5,
+                "hardness": 1.0,
+                "feather": 0,
+            },
+        )
+        with self.assertRaisesRegex(RuntimeError, "Cần model AI local lấp nền watermark"):
+            self.coordinator.dispatch(
+                "preview_watermark",
+                {"project_id": project_id, "session_id": session["session_id"], "quality": "FAST"},
+            )
+        np.testing.assert_array_equal(self.coordinator.store.read_working_rgb(project_id), before)
 
     def test_wand_preview_commit_and_subject_selection_contracts(self) -> None:
         imported = self.coordinator.dispatch("import_image", {"path": str(self.source)})
@@ -1221,7 +1365,7 @@ class LocalModelRuntimeTests(unittest.TestCase):
             runtime = LocalModelRuntime(root)
             rgb = np.full((4, 4, 3), 180, dtype=np.uint8)
             mask = np.zeros((4, 4), dtype=np.float32)
-            mask[1:3, 1:3] = 1.0
+            mask[1:3, 1:3] = 0.35
             with patch.object(runtime, "_ready", return_value=manifest), patch.object(
                 model_runtime_module, "ort", self.FakeOrt(session)
             ):
@@ -1232,6 +1376,7 @@ class LocalModelRuntimeTests(unittest.TestCase):
             np.testing.assert_array_equal(restored[0, 0], np.array([64, 128, 255], dtype=np.uint8))
             self.assertEqual(diagnostics["status"], "ok")
             self.assertEqual(session.last_inputs["mask"].shape, (1, 1, 4, 4))
+            self.assertEqual(set(np.unique(session.last_inputs["mask"])), {0.0, 1.0})
 
     def test_lite_proposal_uses_overlapping_focus_tiles_after_foreground_click(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

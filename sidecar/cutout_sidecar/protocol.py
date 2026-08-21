@@ -8,6 +8,18 @@ from typing import Any, TextIO
 from .coordinator import Coordinator
 
 
+def _configure_utf8_system_stream(stream: TextIO, system_stream: TextIO) -> None:
+    """Giữ giao thức JSON Unicode ổn định khi app chạy trong Windows console."""
+    if stream is not system_stream:
+        return
+    reconfigure = getattr(stream, "reconfigure", None)
+    if callable(reconfigure):
+        try:
+            reconfigure(encoding="utf-8", errors="strict")
+        except (OSError, ValueError):
+            pass
+
+
 def handle_request(coordinator: Coordinator, request: dict[str, Any]) -> dict[str, Any]:
     request_id = request.get("id")
     try:
@@ -34,6 +46,8 @@ def handle_request(coordinator: Coordinator, request: dict[str, Any]) -> dict[st
 def serve_stdio(input_stream: TextIO | None = None, output_stream: TextIO | None = None) -> None:
     input_stream = input_stream or sys.stdin
     output_stream = output_stream or sys.stdout
+    _configure_utf8_system_stream(input_stream, sys.stdin)
+    _configure_utf8_system_stream(output_stream, sys.stdout)
     coordinator = Coordinator()
     for line in input_stream:
         stripped = line.strip()

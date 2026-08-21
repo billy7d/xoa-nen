@@ -2,59 +2,12 @@ from __future__ import annotations
 
 from typing import Any
 
-import cv2
 import numpy as np
 
-from .analyzer import analyze_watermark
-from .deblend import attenuate_transparent_overlay
-from .harmonize import harmonize_boundary
-from .inpaint import ai_restore, expanded_bounds, restore_roi_with_candidate, telea_restore
-from .mask import bounds_from_mask, hard_mask
-from .patch_restore import reference_patch_restore
+from .inpaint import ai_restore
+from .mask import bounds_from_mask
 from .quality import score_candidate
 from .router import choose_route
-
-
-def _candidate_patch_restore(
-    rgb: np.ndarray,
-    soft_mask: np.ndarray,
-    quality: str,
-) -> tuple[np.ndarray, dict[str, Any]]:
-    height, width = soft_mask.shape
-    roi = expanded_bounds(soft_mask, width, height, quality)
-    if roi == (0, 0, 0, 0):
-        raise ValueError("Chưa có vùng watermark để xóa")
-    x0, y0, x1, y1 = roi
-    radius = 2 if str(quality).upper() == "FAST" else 3
-    if str(quality).upper() == "MAXIMUM":
-        radius = 4
-    candidate_roi = reference_patch_restore(
-        rgb[y0:y1, x0:x1],
-        hard_mask(soft_mask[y0:y1, x0:x1]),
-        radius=radius,
-    )
-    return restore_roi_with_candidate(rgb, soft_mask, candidate_roi, roi), {
-        "route": "PATCH_RESTORE",
-        "roi": list(roi),
-        "radius": radius,
-    }
-
-
-def _candidate_deblend(
-    rgb: np.ndarray,
-    soft_mask: np.ndarray,
-    quality: str,
-) -> tuple[np.ndarray, dict[str, Any]]:
-    deb = attenuate_transparent_overlay(rgb, soft_mask)
-    # Deblend xử lý watermark mờ; phần core còn sót được lấp rất nhẹ trong ROI.
-    residue_mask = np.where(soft_mask >= 0.72, soft_mask, 0.0).astype(np.float32)
-    if np.any(residue_mask > 0.01):
-        telea, telea_diag = telea_restore(deb, residue_mask, quality)
-        deb = telea
-        telea_route = telea_diag
-    else:
-        telea_route = None
-    return deb, {"route": "DEBLEND", "residue_inpaint": telea_route}
 
 
 def _ai_role(route: str) -> str:
@@ -68,12 +21,6 @@ def _route_candidate(
     quality: str,
     runtime: Any | None,
 ) -> tuple[np.ndarray | None, dict[str, Any]]:
-    if route == "DEBLEND":
-        return _candidate_deblend(rgb, soft_mask, quality)
-    if route == "PATCH_RESTORE":
-        return _candidate_patch_restore(rgb, soft_mask, quality)
-    if route == "TELEA_FAST":
-        return telea_restore(rgb, soft_mask, quality)
     if route in {"AI_FAST", "AI_QUALITY"}:
         return ai_restore(rgb, soft_mask, runtime, quality, _ai_role(route))
     return None, {"status": "unsupported_route", "route": route}
@@ -93,11 +40,21 @@ def restore_watermark(
         raise ValueError("Mask watermark không khớp kích thước ảnh")
     if not np.any(mask > 0.01):
         raise ValueError("Chưa có vùng watermark để xóa")
-    analysis = analyze_watermark(rgb, mask)
     ai_fast_available = bool(runtime is not None and getattr(runtime, "has_role", lambda _role: False)("watermark_inpaint_fast"))
     ai_quality_available = bool(runtime is not None and getattr(runtime, "has_role", lambda _role: False)("watermark_inpaint_quality"))
-    routing = choose_route(analysis, quality, ai_fast_available, ai_quality_available)
-    candidates: list[tuple[np.ndarray, dict[str, Any], dict[str, Any]]] = []
+    routing = choose_route(quality, ai_fast_available, ai_quality_available)
+    if not routing["fallbacks"]:
+        raise RuntimeError(
+            "Cần model AI local lấp nền watermark. Hãy cài model-pack ONNX có role "
+            "watermark_inpaint_fast hoặc watermark_inpaint_quality."
+        )
+    minimum_score = {
+        "FAST": 0.74,
+        "BALANCED": 0.80,
+        "MAXIMUM": 0.84,
+    }.get(str(routing["quality"]), 0.80)
+    minimum_change = 2.0
+    accepted: tuple[np.ndarray, dict[str, Any]] | None = None
     attempts: list[dict[str, Any]] = []
     for route in routing["fallbacks"][: max(1, max_retries + 1)]:
         try:
@@ -108,27 +65,64 @@ def restore_watermark(
         if candidate is None:
             attempts.append({"route": route, **diagnostics})
             continue
-        harmonized = harmonize_boundary(rgb, candidate, mask)
-        score = score_candidate(rgb, harmonized, mask)
-        diagnostics = {**diagnostics, "status": "ok", "quality": score}
-        candidates.append((harmonized, diagnostics, score))
-        attempts.append({"route": route, "status": "ok", "overall": score["overall"]})
-        if float(score["overall"]) >= 0.86:
+        score = score_candidate(rgb, candidate, mask)
+        diagnostics = {
+            **diagnostics,
+            "status": "ok",
+            "quality": score,
+            "minimum_quality": minimum_score,
+        }
+        quality_passed = (
+            float(score.get("overall", 0.0)) >= minimum_score
+            and float(score.get("changed_mean", 0.0)) >= minimum_change
+        )
+        if quality_passed:
+            accepted = (candidate, diagnostics)
+            attempts.append(
+                {
+                    "route": route,
+                    "status": "ok",
+                    "model_id": diagnostics.get("model_id"),
+                    "overall": score.get("overall"),
+                }
+            )
+            # Một model AI vượt quality gate là kết quả cuối; không hậu xử lý bằng thuật toán.
             break
-    if not candidates:
-        fallback, diagnostics = telea_restore(rgb, mask, routing["quality"])
-        harmonized = harmonize_boundary(rgb, fallback, mask)
-        score = score_candidate(rgb, harmonized, mask)
-        candidates.append((harmonized, {**diagnostics, "status": "ok", "quality": score}, score))
-    best = max(candidates, key=lambda item: float(item[2].get("overall", 0.0)))
-    changed = cv2.dilate((mask > 0.005).astype(np.uint8), np.ones((5, 5), np.uint8), iterations=1)
-    bounds = bounds_from_mask(changed, 0)
+        attempts.append(
+            {
+                "route": route,
+                "status": "quality_rejected",
+                "model_id": diagnostics.get("model_id"),
+                "overall": score.get("overall"),
+                "minimum_quality": minimum_score,
+                "minimum_change": minimum_change,
+            }
+        )
+    if accepted is None:
+        summary = "; ".join(
+            f"{item.get('route')}: {item.get('status', 'failed')}"
+            + (f" ({item.get('overall')})" if item.get("overall") is not None else "")
+            for item in attempts
+        )
+        raise RuntimeError(
+            "Model AI local chưa tái tạo nền đạt quality gate; ảnh chưa bị thay đổi. "
+            "Hãy chỉnh mask phủ kín watermark hoặc chọn mức chất lượng khác. "
+            f"Chi tiết: {summary or 'không có kết quả inference'}"
+        )
+    best = accepted
+    bounds = bounds_from_mask(mask, 0.005)
     diagnostics = {
-        "algorithm_version": "watermark-restore-v2-router",
-        "analysis": analysis,
+        "algorithm_version": "watermark-restore-v3.1-ai-local-gated",
         "routing": routing,
         "attempts": attempts,
         "selected": best[1],
+        "quality_gate": {
+            "status": "PASS",
+            "minimum": minimum_score,
+            "overall": best[1].get("quality", {}).get("overall"),
+            "minimum_change": minimum_change,
+            "changed_mean": best[1].get("quality", {}).get("changed_mean"),
+        },
         "bounds": list(bounds),
         "pixel_preservation": "outside_bounds_unchanged",
     }

@@ -5,10 +5,12 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:desktop": "npm run models:provision && npm run dev",
     "build": "tsc -b && vite build",
-    "build:desktop-assets": "npm run build && npm run build:sidecar",
+    "build:desktop-assets": "npm run models:provision && npm run build && npm run build:sidecar",
     "preview": "vite preview",
     "tauri": "tauri",
+    "models:provision": "node scripts/provision-models.mjs",
     "build:sidecar": "node scripts/build-sidecar.mjs",
     "test:navigation": "node --experimental-strip-types --test tests/canvas_navigation.test.ts",
     "test:sidecar": "bash scripts/test-sidecar.sh",

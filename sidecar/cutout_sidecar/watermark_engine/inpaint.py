@@ -2,10 +2,9 @@ from __future__ import annotations
 
 from typing import Any
 
-import cv2
 import numpy as np
 
-from .mask import bounds_from_mask, hard_mask
+from .mask import bounds_from_mask
 
 
 def restoration_weight(soft_mask: np.ndarray) -> np.ndarray:
@@ -23,11 +22,20 @@ def expanded_bounds(
     x0, y0, x1, y1 = bounds_from_mask(mask, 0.01)
     if x1 <= x0 or y1 <= y0:
         return (0, 0, 0, 0)
-    extent = max(x1 - x0, y1 - y0)
-    multiplier = 2.0 if str(quality).upper() == "FAST" else 3.0
-    if str(quality).upper() == "MAXIMUM":
-        multiplier = 4.0
-    margin = max(12, min(512, int(round(extent * multiplier))))
+    width_span, height_span = x1 - x0, y1 - y0
+    major_span, minor_span = max(width_span, height_span), min(width_span, height_span)
+    normalized_quality = str(quality).upper()
+    if normalized_quality == "MAXIMUM":
+        minor_context, major_context = 0.85, 0.40
+    elif normalized_quality == "FAST":
+        minor_context, major_context = 0.45, 0.24
+    else:
+        minor_context, major_context = 0.65, 0.32
+    # Giữ ROI AI đủ ngữ cảnh nhưng không phóng đại watermark dài đến mức mất chi tiết nền ở 512px.
+    margin = max(
+        32,
+        min(320, int(round(max(minor_span * minor_context, major_span * major_context)))),
+    )
     return (
         max(0, x0 - margin),
         max(0, y0 - margin),
@@ -54,25 +62,6 @@ def restore_roi_with_candidate(
     return output
 
 
-def telea_restore(rgb: np.ndarray, soft_mask: np.ndarray, quality: str = "BALANCED") -> tuple[np.ndarray, dict[str, Any]]:
-    height, width = soft_mask.shape
-    roi = expanded_bounds(soft_mask, width, height, quality)
-    if roi == (0, 0, 0, 0):
-        raise ValueError("Chưa có vùng watermark để xóa")
-    x0, y0, x1, y1 = roi
-    local_rgb = rgb[y0:y1, x0:x1]
-    local_mask = hard_mask(soft_mask[y0:y1, x0:x1])
-    radius = 3 if str(quality).upper() == "FAST" else 4
-    if str(quality).upper() == "MAXIMUM":
-        radius = 5
-    repaired_roi = cv2.inpaint(local_rgb, local_mask, radius, cv2.INPAINT_TELEA)
-    return restore_roi_with_candidate(rgb, soft_mask, repaired_roi, roi), {
-        "route": "TELEA_FAST",
-        "roi": list(roi),
-        "radius": radius,
-    }
-
-
 def ai_restore(
     rgb: np.ndarray,
     soft_mask: np.ndarray,
@@ -87,9 +76,11 @@ def ai_restore(
     if roi == (0, 0, 0, 0):
         return None, {"status": "empty_mask", "role": role}
     x0, y0, x1, y1 = roi
+    # LaMa nhận mask nhị phân; feather chỉ dùng khi ghép kết quả để mép không bị gắt.
+    model_mask = (soft_mask[y0:y1, x0:x1] > 0.01).astype(np.float32)
     repaired_roi, diagnostics = runtime.inpaint_rgb(
         rgb[y0:y1, x0:x1],
-        soft_mask[y0:y1, x0:x1],
+        model_mask,
         role=role,
         context={"quality": str(quality).upper(), "roi": list(roi)},
     )
@@ -99,4 +90,5 @@ def ai_restore(
         **diagnostics,
         "route": "AI_QUALITY" if role.endswith("quality") else "AI_FAST",
         "roi": list(roi),
+        "model_mask_pixels": int(np.count_nonzero(model_mask)),
     }

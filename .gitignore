@@ -12,11 +12,14 @@ __pycache__/
 .venv/
 projects/
 exports/
-models/
+models/*
+!models/.gitkeep
 .model-staging/
 sidecar/dist/
 sidecar/build/
 *.spec
 artifacts/
 *.app/
+/Local POD Cutout Editor/
+/src-tauri/.tmp-launcher-release-target/
 

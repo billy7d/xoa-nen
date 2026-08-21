@@ -4,7 +4,6 @@ from typing import Any
 
 
 def choose_route(
-    analysis: dict[str, Any],
     quality: str = "BALANCED",
     ai_fast_available: bool = False,
     ai_quality_available: bool = False,
@@ -12,39 +11,26 @@ def choose_route(
     normalized_quality = str(quality).upper()
     if normalized_quality == "MAX":
         normalized_quality = "MAXIMUM"
-    mask_ratio = float(analysis.get("mask_ratio", 0.0))
-    texture = str(analysis.get("texture", "TEXTURE")).upper()
-    transparency = float(analysis.get("transparency_score", 0.0))
-    structure = float(analysis.get("structure_score", 0.0))
-    semantic = float(analysis.get("semantic_complexity", 0.0))
-    if transparency >= 0.62 and mask_ratio <= 0.22:
-        primary = "DEBLEND"
-    elif texture in {"GEOMETRIC", "TEXTURE"} and structure >= 0.18 and mask_ratio <= 0.18:
-        primary = "PATCH_RESTORE"
-    elif mask_ratio <= 0.0035 and texture in {"FLAT", "GRADIENT"}:
-        primary = "TELEA_FAST"
-    elif normalized_quality == "MAXIMUM" and ai_quality_available:
+    if normalized_quality == "MAXIMUM" and ai_quality_available:
         primary = "AI_QUALITY"
-    elif ai_fast_available and normalized_quality in {"BALANCED", "MAXIMUM"}:
+    elif ai_fast_available:
         primary = "AI_FAST"
-    elif semantic >= 0.45 and texture != "FLAT":
-        primary = "PATCH_RESTORE"
+    elif ai_quality_available:
+        # Người dùng vẫn có thể chạy model quality khi chỉ có pack đó được cài.
+        primary = "AI_QUALITY"
     else:
-        primary = "TELEA_FAST"
+        primary = None
 
-    fallbacks = [primary]
-    for route in (
-        "PATCH_RESTORE",
-        "AI_FAST" if ai_fast_available else "",
-        "AI_QUALITY" if ai_quality_available and normalized_quality == "MAXIMUM" else "",
-        "TELEA_FAST",
-    ):
+    # Chỉ thử các model AI local khác khi model ưu tiên không chạy; không có fallback thuật toán.
+    fallbacks = [primary] if primary else []
+    for route in ("AI_QUALITY" if ai_quality_available else "", "AI_FAST" if ai_fast_available else ""):
         if route and route not in fallbacks:
             fallbacks.append(route)
     return {
         "primary": primary,
-        "fallbacks": fallbacks[:3],
+        "fallbacks": fallbacks,
         "quality": normalized_quality,
         "ai_fast_available": bool(ai_fast_available),
         "ai_quality_available": bool(ai_quality_available),
+        "requires_local_ai": True,
     }

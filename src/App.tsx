@@ -486,6 +486,12 @@ export default function App() {
   const installedModels = models.filter((model) => model.installed);
   const qualifiedModels = installedModels.filter((model) => model.quality_qualified);
   const aiReady = installedModels.some((model) => model.role === "base_alpha_proposal");
+  const watermarkFastReady = installedModels.some((model) => model.role === "watermark_inpaint_fast");
+  const watermarkQualityReady = installedModels.some((model) => model.role === "watermark_inpaint_quality");
+  const watermarkAiReady = watermarkFastReady || watermarkQualityReady;
+  const watermarkRole = watermarkQuality === "MAXIMUM" && watermarkQualityReady
+    ? "watermark_inpaint_quality"
+    : watermarkFastReady ? "watermark_inpaint_fast" : "watermark_inpaint_quality";
   const tolerance = engineProfile === "LEGACY_V1" ? legacyTolerance : autoTolerance;
   const softness = engineProfile === "LEGACY_V1" ? legacySoftness : autoSoftness;
   const upscaleRole = upscaleMode === "SHARP" && upscaleScale === 3 ? "upscale_sharp_x4" : `upscale_${upscaleMode.toLowerCase()}_x${upscaleScale}`;
@@ -526,7 +532,7 @@ export default function App() {
             <input aria-label="Màu nền tùy chọn" type="color" value={backgroundColor} onChange={(event) => { setBackgroundColor(event.target.value); setBackground("custom"); }} />
           </div>
           {wandPreview && <div className="wand-preview-bar"><span>{wandPreview.selected_pixel_count.toLocaleString()} px được chọn</span><button onClick={commitWand} title="Enter">Áp dụng ↵</button><button onClick={() => cancelWand()} title="Escape">Hủy Esc</button></div>}
-          {watermarkSession && <div className="wand-preview-bar"><span>{watermarkSession.status === "READY" ? "Preview phục hồi đã sẵn sàng" : `${watermarkSession.mask_pixel_count.toLocaleString()} px trong mask`}</span><button className={watermarkView === "ORIGINAL" ? "active" : ""} onClick={() => { setWatermarkView("ORIGINAL"); setWatermarkMaskVisible(false); }}>Gốc</button><button className={watermarkView === "MASK" ? "active" : ""} onClick={() => { setWatermarkView("MASK"); setWatermarkMaskVisible(true); }}>Mask</button><button className={watermarkView === "RESULT" ? "active" : ""} onClick={() => { setWatermarkView("RESULT"); setWatermarkMaskVisible(false); }} disabled={!watermarkSession.preview_path}>Kết quả</button><button onClick={() => previewWatermarkSession()} disabled={!watermarkSession.mask_pixel_count || !!busy}>Tạo preview</button><button onClick={applyWatermarkSession} disabled={watermarkSession.status !== "READY" || !!busy} title="Enter">Áp dụng ↵</button><button onClick={() => cancelWatermarkSession()} disabled={!!busy} title="Escape">Hủy Esc</button></div>}
+          {watermarkSession && <div className="wand-preview-bar"><span>{watermarkSession.status === "READY" ? "Preview phục hồi đã sẵn sàng" : `${watermarkSession.mask_pixel_count.toLocaleString()} px trong mask`}</span><button className={watermarkView === "ORIGINAL" ? "active" : ""} onClick={() => { setWatermarkView("ORIGINAL"); setWatermarkMaskVisible(false); }}>Gốc</button><button className={watermarkView === "MASK" ? "active" : ""} onClick={() => { setWatermarkView("MASK"); setWatermarkMaskVisible(true); }}>Mask</button><button className={watermarkView === "RESULT" ? "active" : ""} onClick={() => { setWatermarkView("RESULT"); setWatermarkMaskVisible(false); }} disabled={!watermarkSession.preview_path}>Kết quả</button><button onClick={() => previewWatermarkSession()} disabled={!watermarkSession.mask_pixel_count || !watermarkAiReady || !!busy}>Tạo preview</button><button onClick={applyWatermarkSession} disabled={watermarkSession.status !== "READY" || !!busy} title="Enter">Áp dụng ↵</button><button onClick={() => cancelWatermarkSession()} disabled={!!busy} title="Escape">Hủy Esc</button></div>}
           <div className="background-picker" aria-label="Nền preview">{(["checker", "white", "black", "garment", "custom"] as const).map((item) => <button key={item} className={`${item} ${background === item ? "active" : ""}`} onClick={() => setBackground(item)} title={`Nền ${item}`} />)}</div>
         </section>
 
@@ -535,7 +541,7 @@ export default function App() {
 
           {panel === "controls" && <div className="panel-content">
             <section className="control-section">
-              <div className="section-heading"><div><strong>XÓA WATERMARK</strong><small>Mask → Preview → Apply</small></div><span className="pill">LOCAL</span></div>
+              <div className="section-heading"><div><strong>XÓA WATERMARK</strong><small>Mask → AI Local → Preview → Apply</small></div><span className="pill">AI LOCAL</span></div>
               <label>Quality<select value={watermarkQuality} onChange={(event) => {
                 const next = event.target.value as WatermarkQuality;
                 setWatermarkQuality(next);
@@ -547,7 +553,7 @@ export default function App() {
                 }
               }}><option value="FAST">Fast</option><option value="BALANCED">Balanced</option><option value="MAXIMUM">Maximum</option></select></label>
               <div className="subject-actions">
-                <button type="button" onClick={autoDetectWatermark} disabled={!project || !!busy}>Tự tìm & preview</button>
+                <button type="button" onClick={autoDetectWatermark} disabled={!project || !watermarkAiReady || !!busy}>Tự tìm & preview</button>
                 <button type="button" className={tool === "watermark" ? "active" : ""} onClick={() => { setTool("watermark"); void beginWatermarkSession(); }} disabled={!project || !!busy}>Brush (M)</button>
               </div>
               <div className="subject-actions watermark-mode-row">
@@ -559,10 +565,11 @@ export default function App() {
               <label className="check-row"><input type="checkbox" checked={watermarkMaskVisible} onChange={(event) => setWatermarkMaskVisible(event.target.checked)} /><span>Show Mask</span></label>
               {watermarkSession ? <div className="watermark-session-stats"><span>Mask<b>{watermarkSession.mask_pixel_count.toLocaleString()} px</b></span><span>Core<b>{watermarkSession.strong_pixel_count.toLocaleString()} px</b></span><span>{watermarkSession.source}</span></div> : null}
               <div className="subject-actions">
-                <button type="button" onClick={() => previewWatermarkSession()} disabled={!project || !watermarkSession?.mask_pixel_count || !!busy}>Tạo preview</button>
+                <button type="button" onClick={() => previewWatermarkSession()} disabled={!project || !watermarkSession?.mask_pixel_count || !watermarkAiReady || !!busy}>Tạo preview</button>
                 <button type="button" className="primary-action" onClick={applyWatermarkSession} disabled={!project || watermarkSession?.status !== "READY" || !!busy}>Apply</button>
                 <button type="button" onClick={() => cancelWatermarkSession()} disabled={!watermarkSession || !!busy}>Cancel</button>
               </div>
+              <p className="hint">{watermarkAiReady ? `Lấp nền chỉ dùng ${watermarkRole} chạy trên máy; không dùng Telea, Patch hay Deblend.` : "Cần cài model-pack AI local có role watermark_inpaint_fast hoặc watermark_inpaint_quality trước khi tạo preview; app không dùng thuật toán lấp nền thay thế."}</p>
               <p className="hint">RGB chỉ thay đổi sau khi preview đã được kiểm tra và bấm Apply. Sửa mask sẽ tự hủy preview cũ.</p>
               {project?.retouch?.watermark_removed ? <p className="success-note">Watermark đã được xử lý trong ảnh xuất.</p> : null}
             </section>

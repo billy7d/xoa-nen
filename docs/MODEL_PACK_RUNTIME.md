@@ -9,6 +9,8 @@
 
 Mọi model phải được đóng gói thành `.cutout-modelpack` có manifest, SHA-256 và chữ ký Ed25519 hợp lệ. Runtime không tải hoặc thực thi Python code của model; checkpoint PyTorch thô, đặc biệt `.pt` của SAM2, không được cài trực tiếp.
 
+Git chỉ lưu manifest đã ký trong `model-manifests/`, không lưu ONNX weights. `npm run models:provision` tải đúng URL/revision đã pin, kiểm tra size, SHA-256, chữ ký và policy rồi mới cài vào `models/`. Thư mục weights này bị Git ignore nhưng được Tauri bundle vào artifact desktop local; vì vậy Windows và macOS dùng cùng contract mà repository không bị phình lớn.
+
 `runtime_ready` chỉ xác nhận artifact, chữ ký, policy và backend đủ để chạy. `quality_qualified` chỉ được bật khi manifest đã qua corpus/metric Phase 0. UI và release tooling không được suy diễn quality từ `installed=true`.
 
 ## Contract manifest
@@ -88,7 +90,7 @@ Manifest phải khai báo hoặc để runtime tự dò:
 }
 ```
 
-Runtime chỉ gửi ROI đã mở rộng theo mask, rồi composite về ảnh native bằng soft mask. Pixel ngoài ROI/blend ring phải giữ nguyên byte-for-byte. Nếu role chưa cài, backend không lỗi app; router fallback sang Deblend/Patch/Telea local.
+Runtime chỉ gửi ROI đã mở rộng theo mask, rồi composite về ảnh native bằng soft mask. Pixel ngoài ROI/blend ring phải giữ nguyên byte-for-byte. Watermark v3 chỉ chấp nhận output từ model AI local: nếu role chưa cài hoặc inference lỗi, preview dừng và báo rõ để người dùng cài/sửa model-pack; tuyệt đối không fallback sang Deblend, Patch, Telea hay thuật toán lấp nền khác.
 
 ## Trạng thái hiện tại
 
@@ -97,4 +99,6 @@ Checkout local đã cài hai pack ONNX trong thư mục bị bỏ qua bởi Git 
 - `studioludens-birefnet-lite-512`, revision `4a3c40c36c94093cc1e724d9ea428b8fa4b57dc7`, license MIT, tạo proposal bằng CPU.
 - `xenova-vitmatte-small-composition-1k`, revision `6bc1297f6140f055a227b6d2cfe8c093281f35d2`, model gốc Apache-2.0, refine unknown ROI bằng CPU.
 
-Smoke test qua worker đã gọi cả hai model, output float32 hữu hạn trong `[0, 1]`. SAM2 và watermark inpainting chưa cài artifact ONNX nên topology/inpaint AI giữ trạng thái tùy chọn và không chặn pipeline. Hai pack hiện chỉ là `runtime_ready_quality_pending`; cần chạy Phase 0 trên corpus riêng và A/B ViTMatte FP32/FP16 với bản QUInt8 trước khi dùng cho POD thương mại.
+Smoke test qua worker đã gọi cả hai model, output float32 hữu hạn trong `[0, 1]`. SAM2 vẫn tùy chọn. Watermark v3 có thể dùng pack cục bộ `local-opencv-lama-watermark-512` (LaMa ONNX từ OpenCV, `watermark_inpaint_fast`, BGR, 512×512); pack nằm trong `models/` bị Git ignore, có SHA-256/chữ ký hợp lệ và đang ở `runtime_ready_quality_pending`. Bản desktop bundle pack này rồi seed một lần vào AppData khi khởi động, vì pipeline không có fallback thuật toán. Các pack chưa được Phase 0 vẫn cần corpus riêng trước khi được gắn `quality_qualified` cho POD thương mại.
+
+Watermark v3.1 tuân thủ đúng contract OpenCV LaMa: mask được resize rồi nhị phân hóa trước inference. Auto detect ưu tiên nhận diện hình học Gemini sparkle ở góc phải dưới và chặn mọi mask classical vượt 6% diện tích ảnh. Cả auto lẫn brush dùng chung pipeline AI local và chỉ cho phép preview/commit khi output vượt quality gate; kết quả bị từ chối không thay đổi working RGB.

@@ -1,8 +1,8 @@
 use serde_json::Value;
 use std::env;
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Manager, State};
@@ -15,6 +15,68 @@ use tauri::Emitter;
 
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+fn copy_model_directory(source: &Path, destination: &Path) -> Result<(), String> {
+    fs::create_dir_all(destination).map_err(|error| {
+        format!(
+            "Không tạo được thư mục model local {}: {error}",
+            destination.display()
+        )
+    })?;
+
+    for entry in fs::read_dir(source)
+        .map_err(|error| format!("Không đọc được model bundled {}: {error}", source.display()))?
+    {
+        let entry = entry.map_err(|error| format!("Không đọc được file model bundled: {error}"))?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let kind = entry
+            .file_type()
+            .map_err(|error| format!("Không xác định được loại file model: {error}"))?;
+        if kind.is_dir() {
+            copy_model_directory(&source_path, &destination_path)?;
+        } else if kind.is_file() {
+            fs::copy(&source_path, &destination_path).map_err(|error| {
+                format!(
+                    "Không sao chép được model AI local {}: {error}",
+                    source_path.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn seed_bundled_model_packs(source_root: &Path, destination_root: &Path) -> Result<(), String> {
+    if !source_root.is_dir() {
+        return Ok(());
+    }
+    fs::create_dir_all(destination_root).map_err(|error| {
+        format!(
+            "Không tạo được thư mục model của ứng dụng {}: {error}",
+            destination_root.display()
+        )
+    })?;
+
+    for entry in fs::read_dir(source_root).map_err(|error| {
+        format!(
+            "Không đọc được thư mục model bundled {}: {error}",
+            source_root.display()
+        )
+    })? {
+        let entry = entry.map_err(|error| format!("Không đọc được model bundled: {error}"))?;
+        let source_pack = entry.path();
+        let destination_pack = destination_root.join(entry.file_name());
+        // Chỉ seed một model-pack hoàn chỉnh và không ghi đè model do người dùng đã cài.
+        if source_pack.is_dir()
+            && source_pack.join("manifest.json").is_file()
+            && !destination_pack.exists()
+        {
+            copy_model_directory(&source_pack, &destination_pack)?;
+        }
+    }
+    Ok(())
+}
 
 #[cfg(target_os = "macos")]
 #[derive(Clone, serde::Serialize)]
@@ -101,6 +163,19 @@ impl CoordinatorProcess {
         std::fs::create_dir_all(&app_data)
             .map_err(|error| format!("Không tạo được app data directory: {error}"))?;
 
+        let app_models_dir = app_data.join("models");
+        let bundled_models_dir = resource_dir.join("models");
+        let dev_models_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("models");
+        // Dev dùng pack trong workspace; bản đóng gói dùng resource rồi seed vào AppData.
+        let seed_source = if bundled_models_dir.is_dir() {
+            bundled_models_dir
+        } else {
+            dev_models_dir
+        };
+        seed_bundled_model_packs(&seed_source, &app_models_dir)?;
+
         let mut command = if packaged_executable.exists() {
             Command::new(&packaged_executable)
         } else {
@@ -112,7 +187,7 @@ impl CoordinatorProcess {
         command
             .current_dir(&app_data)
             .env("CUTOUT_PROJECTS_DIR", app_data.join("projects"))
-            .env("CUTOUT_MODELS_DIR", app_data.join("models"));
+            .env("CUTOUT_MODELS_DIR", &app_models_dir);
 
         #[cfg(target_os = "windows")]
         // Ngăn sidecar và các worker con tự tạo cửa sổ terminal khi app chạy nền.
@@ -252,12 +327,67 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(CoordinatorState::new())
-        .setup(|app| {
+        .setup(|_app| {
             #[cfg(target_os = "macos")]
-            install_macos_magnify_monitor(app.handle().clone());
+            install_macos_magnify_monitor(_app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![coordinator_request])
         .run(tauri::generate_context!())
         .expect("error while running Local POD Cutout Editor");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::seed_bundled_model_packs;
+    use std::fs;
+
+    #[test]
+    fn seeds_complete_bundled_packs_without_overwriting_user_model() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time hợp lệ")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "cutout-model-seed-test-{}-{unique}",
+            std::process::id()
+        ));
+        let source_root = root.join("bundled");
+        let destination_root = root.join("app-data").join("models");
+
+        let existing_source = source_root.join("existing");
+        fs::create_dir_all(&existing_source).expect("tạo source pack");
+        fs::write(existing_source.join("manifest.json"), "new-manifest").expect("ghi manifest source");
+        fs::write(existing_source.join("model.onnx"), b"new-model").expect("ghi model source");
+
+        let existing_destination = destination_root.join("existing");
+        fs::create_dir_all(&existing_destination).expect("tạo model người dùng");
+        fs::write(existing_destination.join("manifest.json"), "user-manifest")
+            .expect("ghi manifest người dùng");
+        fs::write(existing_destination.join("model.onnx"), b"user-model")
+            .expect("ghi model người dùng");
+
+        let fresh_source = source_root.join("fresh");
+        fs::create_dir_all(&fresh_source).expect("tạo pack mới");
+        fs::write(fresh_source.join("manifest.json"), "fresh-manifest").expect("ghi manifest mới");
+        fs::write(fresh_source.join("model.onnx"), b"fresh-model").expect("ghi model mới");
+
+        let incomplete_source = source_root.join("incomplete");
+        fs::create_dir_all(&incomplete_source).expect("tạo pack thiếu manifest");
+        fs::write(incomplete_source.join("model.onnx"), b"ignored").expect("ghi model thiếu manifest");
+
+        seed_bundled_model_packs(&source_root, &destination_root).expect("seed model bundled");
+
+        assert_eq!(
+            fs::read(existing_destination.join("model.onnx")).expect("đọc model người dùng"),
+            b"user-model"
+        );
+        assert_eq!(
+            fs::read(destination_root.join("fresh").join("model.onnx")).expect("đọc model mới"),
+            b"fresh-model"
+        );
+        assert!(!destination_root.join("incomplete").exists());
+
+        fs::remove_dir_all(root).expect("dọn thư mục test");
+    }
 }

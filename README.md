@@ -17,7 +17,7 @@
 - Export `MASTER_SOURCE_FAITHFUL`, `POD_READY` và `ALPHA_ONLY` 16-bit.
 - Release sidecar bằng PyInstaller; máy người dùng không cần Python.
 
-Model AI không bundle sẵn. App chỉ cài `.cutout-modelpack` ONNX có Ed25519 signature, SHA-256, size, commercial/redistribution policy và backend đã qualification; runtime ưu tiên TensorRT/CUDA/DirectML/CoreML/CPU theo manifest, không dùng `trust_remote_code`. BiRefNet Lite-matting tạo proposal, ViTMatte refine ROI và SAM2 chỉ gate topology; tất cả vẫn cần artifact được ký và corpus 100 ảnh hợp pháp trước khi dùng cho POD.
+Git không lưu model weights để repository luôn gọn. Script provision tải đúng revision ONNX đã pin, kiểm tra size, SHA-256 và chữ ký Ed25519 rồi mới đặt vào `models/`; Tauri bundle thư mục local này vào bản desktop và seed một lần sang AppData. Runtime không dùng `trust_remote_code`. BiRefNet Lite 512 tạo proposal, ViTMatte Small refine unknown ROI và OpenCV LaMa phục hồi watermark bằng AI local; SAM2 vẫn là topology gate tùy chọn. Các pack hiện ở mức `runtime_ready_quality_pending`, chưa phải công bố chất lượng thương mại.
 
 ## Chạy development
 
@@ -27,10 +27,32 @@ Yêu cầu Node.js, Rust stable và Python có Pillow + NumPy.
 npm install
 python3 -m venv .venv
 .venv/bin/pip install -r sidecar/requirements-build.txt
+# Tải ba model ONNX đã pin; file weights nằm local và bị Git ignore.
+npm run models:provision
 ./scripts/dev-desktop.sh
 ```
 
-Nếu Python cần dùng không nằm ở `.venv`, đặt `CUTOUT_PYTHON` khi chạy script dev.
+`npm run tauri dev` và `npm run tauri build` cũng tự gọi provision trước khi chạy. Nếu Python cần dùng không nằm ở `.venv`, đặt `CUTOUT_PYTHON` khi chạy script dev hoặc `CUTOUT_BUILD_PYTHON` khi build.
+
+### Đồng bộ sang macOS
+
+Sau khi pull source trên macOS:
+
+```sh
+npm install
+python3 -m venv .venv
+.venv/bin/pip install -r sidecar/requirements-build.txt
+npm run models:provision
+npm run tauri dev
+```
+
+Ba pack được tái tạo local, không tải qua Git:
+
+- `studioludens-birefnet-lite-512`: proposal cho `V3_AI_LOCAL`.
+- `xenova-vitmatte-small-composition-1k`: matte biên/chi tiết trong suốt.
+- `local-opencv-lama-watermark-512`: inpaint AI local cho watermark.
+
+Muốn chỉ kiểm tra pack đã cài mà không tải lại, chạy `.venv/bin/python scripts/provision-models.py --verify-only`.
 
 ## Kiểm thử
 

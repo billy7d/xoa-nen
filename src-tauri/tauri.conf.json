@@ -4,7 +4,7 @@
   "version": "0.3.0",
   "identifier": "local.pod.cutout.editor",
   "build": {
-    "beforeDevCommand": "npm run dev",
+    "beforeDevCommand": "npm run dev:desktop",
     "devUrl": "http://localhost:1420",
     "beforeBuildCommand": "npm run build:desktop-assets",
     "frontendDist": "../dist"
@@ -39,7 +39,8 @@
       "icons/icon.ico"
     ],
     "resources": {
-      "../sidecar/dist": "sidecar/dist"
+      "../sidecar/dist": "sidecar/dist",
+      "../models": "models"
     }
   }
 }
